@@ -52,7 +52,7 @@
 #define HRES_STR "320"
 #define VRES_STR "240"
 
-#define NUM_REQ_BUFS 6
+#define NUM_REQ_BUFS 32
 #define NUM_BIT_BUCKET_IMGS 10
 
 #define SCHED_POLICY SCHED_FIFO
@@ -99,19 +99,22 @@ struct buffer
         size_t  length;
 };
 
-/* Ring Buffer Structs */
-typedef struct img_buf {
-    unsigned char *p;
+// Image buffer struct
+struct frame_buf {
+    unsigned char *start;
     size_t bytesused;
     struct timeval timestamp;
-} img_buf_t;
-typedef struct ring_buf {
-    img_buf_t *p;
+};
+
+// Ring buffer struct
+struct ring_buf {
+    struct frame_buf *start;
+    size_t size;
     size_t head;
     size_t tail;
-    int num_head_wraps;
-    int num_tail_wraps;
-} ring_buf_t;
+    int head_wraps;
+    int tail_wraps;
+};
 
 /* Thread argument structs */
 struct seq_thread_arg {
@@ -125,19 +128,17 @@ struct seq_thread_arg {
 };
 struct read_thread_arg {
     sem_t *sem;
-    ring_buf_t *raw_ring_buf;
     uint8_t *finished;
 };
 struct process_thread_arg {
     sem_t *sem;
-    ring_buf_t *raw_ring_buf;
-    ring_buf_t *processed_ring_buf;
+    struct ring_buf *selected_frame_bufs;
     uint8_t *read_finished;
     uint8_t *processing_finished;
 };
 struct write_thread_arg {
     sem_t *sem;
-    ring_buf_t *processed_ring_buf;
+    struct ring_buf *selected_frame_bufs;
     uint8_t *finished;
 };
 
@@ -153,16 +154,15 @@ static struct v4l2_format fmt;
 static char            *dev_name;
 static enum io_method   io = IO_METHOD_MMAP;
 static int              fd = -1;
-struct buffer          *buffers;
+struct ring_buf         raw_frame_bufs;
 static unsigned int     n_buffers;
 static int              out_buf;
 static int              force_format=1;
 static int              frame_count = 180;
 
-static size_t ring_buf_size;
 static int read_frames, process_frames, write_frames;
 struct timespec start_time;
-uint32_t img_buf_length;
+uint32_t frame_buf_length;
 
 char pgm_header[]="P5\n#9999999999 sec 9999999999 msec \n"HRES_STR" "VRES_STR"\n255\n";
 char pgm_dumpname[]="test00000000.pgm";
@@ -179,16 +179,16 @@ static void init_device(void);
 static void init_mmap(void);
 static void start_capturing(void);
 static void run_threads(void);
-static void init_ring_buffers(ring_buf_t *raw_ring_buf, ring_buf_t *processed_ring_buf);
-static void free_ring_buffers(ring_buf_t *raw_ring_buf, ring_buf_t *processed_ring_buf);
+static void init_ring_buffer(struct ring_buf *selected_frame_bufs);
+static void free_ring_buffers(struct ring_buf *raw_ring_buf, struct ring_buf *selected_frame_bufs);
 static void timer_handler(union sigval arg);
 static void *sequencer(void *arg);
 void *read_img_thread(void *arg);
-static int read_img(ring_buf_t *raw_ring_buf, int32_t read_count);
+static int read_img(int32_t read_count);
 void *process_img_thread(void *arg);
-static size_t process_img(ring_buf_t *raw_ring_buf);
+static void process_img(struct ring_buf *selected_frame_bufs);
 void *write_img_thread(void *arg);
-void write_img(img_buf_t *processed_img, int32_t write_count);
+void write_img(struct frame_buf *processed_img, int32_t write_count);
 static void stop_capturing(void);
 static void uninit_device(void);
 static void close_device(void);
@@ -265,10 +265,6 @@ int main(int argc, char **argv)
                 exit(EXIT_FAILURE);
         }
     }
-
-    ring_buf_size = frame_count - ((frame_count / READ_FREQ) - 1) * WRITE_FREQ;
-    ring_buf_size += NUM_BIT_BUCKET_IMGS;
-    printf("ring_buf_size = %lu\n", ring_buf_size);
 
     read_frames = READ_FREQ * frame_count;
     process_frames = PROCESS_FREQ * frame_count;
@@ -425,7 +421,7 @@ static void init_device(void)
     init_mmap();
 }
 
-/* Configures camera for mmap and allocates buffers */
+/* Configures camera for mmap and allocates and maps buffers */
 static void init_mmap(void)
 {
         struct v4l2_requestbuffers req;
@@ -455,14 +451,20 @@ static void init_mmap(void)
                 exit(EXIT_FAILURE);
         }
 
-        buffers = calloc(req.count, sizeof(*buffers));
-
-        if (!buffers) 
-        {
+        // Initialize raw_frame_bufs ring buffer
+        raw_frame_bufs.start = calloc(req.count, sizeof(struct frame_buf));
+        if (!raw_frame_bufs.start) {
                 fprintf(stderr, "Out of memory\n");
                 exit(EXIT_FAILURE);
         }
+        raw_frame_bufs.size = req.count;
+        printf("raw_frame_bufs.size = %d\n", req.count);
+        raw_frame_bufs.head = 0;
+        raw_frame_bufs.tail = 0;
+        raw_frame_bufs.head_wraps = 0;
+        raw_frame_bufs.tail_wraps = 0;
 
+        // Map device buffers into memory
         for (n_buffers = 0; n_buffers < req.count; ++n_buffers) {
                 struct v4l2_buffer buf;
 
@@ -475,17 +477,16 @@ static void init_mmap(void)
                 if (-1 == xioctl(fd, VIDIOC_QUERYBUF, &buf))
                         errno_exit("VIDIOC_QUERYBUF");
 
-                img_buf_length = buf.length;
+                frame_buf_length = buf.length;
 
-                buffers[n_buffers].length = buf.length;
-                buffers[n_buffers].start =
+                raw_frame_bufs.start[n_buffers].start =
                         mmap(NULL /* start anywhere */,
                               buf.length,
                               PROT_READ | PROT_WRITE /* required */,
                               MAP_SHARED /* recommended */,
                               fd, buf.m.offset);
 
-                if (MAP_FAILED == buffers[n_buffers].start)
+                if (MAP_FAILED == raw_frame_bufs.start[n_buffers].start)
                         errno_exit("mmap");
         }
 }
@@ -517,7 +518,7 @@ static void start_capturing(void)
 static void run_threads(void)
 {
     int r;
-    ring_buf_t raw_ring_buf, processed_ring_buf;
+    struct ring_buf selected_frame_bufs;
     cpu_set_t cpu_set;
     int max_prio;
     struct sched_param s_param;
@@ -530,10 +531,10 @@ static void run_threads(void)
     pthread_t seq_thread_id, read_thread_id, process_thread_id, write_thread_id;
     uint8_t read_finished = 0, processing_finished = 0, write_finished = 0;
 
-    // Initialize the ring buffers
-    init_ring_buffers(&raw_ring_buf, &processed_ring_buf);
+    // Initialize the ring buffer
+    init_ring_buffer(&selected_frame_bufs);
 
-    // Initialize semaphores
+    // Initialize the semaphores
     r = sem_init(&seq_sem, 0, 0);
     r |= sem_init(&read_sem, 0, 0);
     r |= sem_init(&process_sem, 0, 0);
@@ -544,8 +545,8 @@ static void run_threads(void)
         exit(EXIT_FAILURE);
     }
 
-    /* Create the threads */
-    // Configure sequencer and service thread attributes
+    // Create the threads
+    // Configure all threads with same scheduling policy
     r = pthread_attr_init(&thread_attr);
     r |= pthread_attr_setinheritsched(&thread_attr, PTHREAD_EXPLICIT_SCHED);
     r |= pthread_attr_setschedpolicy(&thread_attr, SCHED_POLICY);
@@ -574,7 +575,7 @@ static void run_threads(void)
     seq_targ.write_finished = &write_finished;
     pthread_create(&seq_thread_id, &thread_attr, sequencer, &seq_targ);
 
-    // Configure the service threads: assign to same CPU core
+    // Assign all service threads to same core
     CPU_ZERO(&cpu_set);
     CPU_SET(SERVICE_CPU, &cpu_set);
     r = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set), &cpu_set);
@@ -591,7 +592,6 @@ static void run_threads(void)
         exit(EXIT_FAILURE);
     }
     read_targ.sem = &read_sem;
-    read_targ.raw_ring_buf = &raw_ring_buf;
     read_targ.finished = &read_finished;
     pthread_create(&read_thread_id, &thread_attr, read_img_thread, &read_targ);
 
@@ -603,8 +603,7 @@ static void run_threads(void)
         exit(EXIT_FAILURE);
     }
     process_targ.sem = &process_sem;
-    process_targ.raw_ring_buf = &raw_ring_buf;
-    process_targ.processed_ring_buf = &processed_ring_buf;
+    process_targ.selected_frame_bufs = &selected_frame_bufs;
     process_targ.read_finished = &read_finished;
     process_targ.processing_finished = &processing_finished;
     pthread_create(&process_thread_id, &thread_attr, process_img_thread, &process_targ);
@@ -617,7 +616,7 @@ static void run_threads(void)
         exit(EXIT_FAILURE);
     }
     write_targ.sem = &write_sem;
-    write_targ.processed_ring_buf = &processed_ring_buf;
+    write_targ.selected_frame_bufs = &selected_frame_bufs;
     write_targ.finished = &write_finished;
     pthread_create(&write_thread_id, &thread_attr, write_img_thread, &write_targ);
 
@@ -643,54 +642,48 @@ static void run_threads(void)
     }
 
     // TODO: Free ring buffers memory
-    //free_ring_buffers(&raw_ring_buf, &processed_ring_buf);
+    //free_ring_buffers(&raw_ring_buf, &selected_frame_bufs);
 }
 
 /* Allocates memory for the ring buffers */
-static void init_ring_buffers(ring_buf_t *raw_ring_buf, ring_buf_t *processed_ring_buf)
+static void init_ring_buffer(struct ring_buf *selected_frame_bufs)
 {
-    // Allocate ring buffers
-    raw_ring_buf->p = (img_buf_t *)malloc(ring_buf_size * sizeof(img_buf_t));
-    if (raw_ring_buf->p == NULL) {
-        fprintf(stderr, "Error init_ring_buffers: Failed to allocate process ring buffer\n");
-        exit(EXIT_FAILURE);
-    }
-    processed_ring_buf->p = (img_buf_t *)malloc(ring_buf_size * sizeof(img_buf_t));
-    if (processed_ring_buf->p == NULL) {
+    // Get necessary size of ring buffer
+    size_t ring_buf_size;
+    ring_buf_size = frame_count - ((frame_count / PROCESS_FREQ) - 1) * WRITE_FREQ;
+    ring_buf_size += NUM_BIT_BUCKET_IMGS;
+    printf("selected_frame_bufs.size = %lu\n", ring_buf_size);
+
+    // Allocate ring buffer
+    selected_frame_bufs->start = (struct frame_buf *)malloc(ring_buf_size * sizeof(struct frame_buf));
+    if (selected_frame_bufs->start == NULL) {
         fprintf(stderr, "Error init_ring_buffers: Failed to allocate write ring buffer\n");
         exit(EXIT_FAILURE);
     }
 
-    // Allocate image buffers within ring buffers
+    // Allocate image buffers within ring buffer
     for (int i = 0; i < ring_buf_size; i++) {
-        raw_ring_buf->p[i].p = (unsigned char *)malloc(img_buf_length * sizeof(unsigned char));
+        selected_frame_bufs->start[i].start = (unsigned char *)malloc(frame_buf_length * sizeof(unsigned char));
 
-        processed_ring_buf->p[i].p = (unsigned char *)malloc(img_buf_length * sizeof(unsigned char));
-
-        if ((raw_ring_buf->p[i].p == NULL) || (processed_ring_buf->p[i].p == NULL)) {
-            fprintf(stderr, "Error init_ring_buffers: Failed to allocate image buffer within ring buffer\n");
-            for (int j = 0; j <= i; j++) {
-                free(raw_ring_buf->p[j].p);
-                free(processed_ring_buf->p[j].p);
+        if (selected_frame_bufs->start[i].start == NULL) {
+            fprintf(stderr, "Error init_ring_buffer: Failed to allocate image buffer within ring buffer\n");
+            for (int j = 0; j < i; j++) {
+                free(selected_frame_bufs->start[j].start);
             }
-            free(raw_ring_buf->p);
-            free(processed_ring_buf->p);
+            free(selected_frame_bufs->start);
             exit(EXIT_FAILURE);
         }
     }
 
-    raw_ring_buf->head = 0;
-    raw_ring_buf->tail = 0;
-    raw_ring_buf->num_head_wraps = 0;
-    raw_ring_buf->num_tail_wraps = 0;
-    processed_ring_buf->head = 0;
-    processed_ring_buf->tail = 0;
-    processed_ring_buf->num_head_wraps = 0;
-    processed_ring_buf->num_tail_wraps = 0;
+    selected_frame_bufs->size = ring_buf_size;
+    selected_frame_bufs->head = 0;
+    selected_frame_bufs->tail = 0;
+    selected_frame_bufs->head_wraps = 0;
+    selected_frame_bufs->tail_wraps = 0;
 }
 
 /* TODO: Frees ring buffers memory */
-static void free_ring_buffers(ring_buf_t *raw_ring_buf, ring_buf_t *processed_ring_buf)
+static void free_ring_buffers(struct ring_buf *raw_ring_buf, struct ring_buf *selected_frame_bufs)
 {
 }
 
@@ -829,7 +822,6 @@ void *read_img_thread(void *arg)
     double delta_time_real;
     struct read_thread_arg *targ = (struct read_thread_arg *)arg;
     sem_t *read_sem = targ->sem;
-    ring_buf_t *raw_ring_buf = targ->raw_ring_buf;
     uint8_t *read_finished = targ->finished;
     int32_t read_count = -NUM_BIT_BUCKET_IMGS;
     struct timespec read_delay;
@@ -848,7 +840,7 @@ void *read_img_thread(void *arg)
             exit(EXIT_FAILURE);
         }
 
-        /* Log time */
+        // Log time
         delta_time_real = get_delta_time_real(start_time);
         syslog(LOG_INFO, "Reading Frame %d @ %lf", read_count, delta_time_real);
 
@@ -866,7 +858,7 @@ void *read_img_thread(void *arg)
             tv.tv_sec = 2;
             tv.tv_usec = 0;
 
-            // Wait for camera device ready to read
+            // Wait until camera device ready to read
             r = select(fd + 1, &fds, NULL, NULL, &tv);
 
             if (-1 == r)
@@ -882,14 +874,18 @@ void *read_img_thread(void *arg)
                 exit(EXIT_FAILURE);
             }
 
-            if (read_img(raw_ring_buf, read_count))
+            if (read_img(read_count))
             {
                 if(nanosleep(&read_delay, &time_error) != 0)
                     perror("nanosleep");
 
                 read_count++;
+
+                // Read succeeded
                 break;
             }
+
+            // Read failed; try again
         }
 
         if(read_count >= read_frames)
@@ -899,7 +895,7 @@ void *read_img_thread(void *arg)
     *read_finished = 1;
 }
 
-static int read_img(ring_buf_t *raw_ring_buf, int32_t read_count)
+static int read_img(int32_t read_count)
 {
     int r;
     struct v4l2_buffer buf;
@@ -909,7 +905,7 @@ static int read_img(ring_buf_t *raw_ring_buf, int32_t read_count)
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
 
-    // Dequeue image buffer
+    // Dequeue frame buffer
     if (-1 == xioctl(fd, VIDIOC_DQBUF, &buf))
     {
         switch (errno)
@@ -931,28 +927,26 @@ static int read_img(ring_buf_t *raw_ring_buf, int32_t read_count)
 
     // Check buffer index in range
     assert(buf.index < n_buffers);
+    syslog(LOG_DEBUG, "Dequeued index %d\n", buf.index);
 
     // Check for buffer overflow
-    if ((raw_ring_buf->head == raw_ring_buf->tail) &&
-            (raw_ring_buf->num_head_wraps > raw_ring_buf->num_tail_wraps)) {
+    if ((raw_frame_bufs.head == raw_frame_bufs.tail) &&
+            (raw_frame_bufs.head_wraps > raw_frame_bufs.tail_wraps)) {
         fprintf(stderr, "Error read_img: Ring buffer overwrite\n");
         exit(EXIT_FAILURE);
     }
-    // Copy from mmapped device buffer to raw_ring_buf
-    memcpy(raw_ring_buf->p[raw_ring_buf->head].p,
-            buffers[buf.index].start, buf.bytesused);
-    raw_ring_buf->p[raw_ring_buf->head].bytesused = buf.bytesused;
-    raw_ring_buf->p[raw_ring_buf->head].timestamp = buf.timestamp;
-    raw_ring_buf->head++;
-    // Check for wrap
-    if (raw_ring_buf->head >= ring_buf_size) {
-        raw_ring_buf->head = 0;
-        raw_ring_buf->num_head_wraps++;
-    }
 
-    /* Enqueue buffer after copying */
-    if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
-            errno_exit("VIDIOC_QBUF write_img");
+    // Update frame buffer parameters
+    raw_frame_bufs.start[raw_frame_bufs.head].bytesused = buf.bytesused;
+    raw_frame_bufs.start[raw_frame_bufs.head].timestamp = buf.timestamp;
+
+    // Increment head position
+    raw_frame_bufs.head++;
+    // Check for wrap
+    if (raw_frame_bufs.head >= raw_frame_bufs.size) {
+        raw_frame_bufs.head = 0;
+        raw_frame_bufs.head_wraps++;
+    }
 
     //printf("R");
     return 1;
@@ -964,15 +958,13 @@ void *process_img_thread(void *arg)
     double delta_time_real;
     struct process_thread_arg *targ = (struct process_thread_arg *)arg;
     sem_t *process_sem = targ->sem;
-    ring_buf_t *raw_ring_buf = targ->raw_ring_buf,
-               *processed_ring_buf = targ->processed_ring_buf;
+    struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
     uint8_t *read_finished = targ->read_finished,
             *processing_finished = targ->processing_finished;
     int32_t process_count = -NUM_BIT_BUCKET_IMGS;
     struct v4l2_buffer buf;
     size_t process_window_head, process_window_tail;
-    ssize_t best_frame_idx, last_best_frame_idx = 0;
-    int num_windows_skipped = 0;
+    ssize_t best_frame_idx;
 
     while (1) {
         /* Wait for processing semaphore */
@@ -984,18 +976,19 @@ void *process_img_thread(void *arg)
 
         /* Check processing not ahead of reading */
         if (!*read_finished) {
-            process_window_head = raw_ring_buf->tail;
-            process_window_tail = (process_window_head + READ_FREQ/PROCESS_FREQ) % ring_buf_size;
-            if ((process_window_head <= raw_ring_buf->head)
-                    && (process_window_tail >= raw_ring_buf->head)) {
+            process_window_head = raw_frame_bufs.tail;
+            process_window_tail = (process_window_head + READ_FREQ/PROCESS_FREQ) %
+                raw_frame_bufs.size;
+            if ((process_window_head <= raw_frame_bufs.head)
+                    && (process_window_tail >= raw_frame_bufs.head)) {
                 syslog(LOG_DEBUG, "Process window overtook read: ph = %d, pt = %d, r = %d\n",
-                        process_window_head, process_window_tail, raw_ring_buf->head);
+                        process_window_head, process_window_tail, raw_frame_bufs.head);
                 continue;
             }
             // Process window wrapped around ring buffer
             if (process_window_tail < process_window_head) {
-                if ((process_window_head <= raw_ring_buf->head)
-                        || (process_window_tail >= raw_ring_buf->head)) {
+                if ((process_window_head <= raw_frame_bufs.head)
+                        || (process_window_tail >= raw_frame_bufs.head)) {
                     syslog(LOG_DEBUG, "Process window wrapped and overtook read\n");
                     continue;
                 }
@@ -1005,31 +998,11 @@ void *process_img_thread(void *arg)
         /* Log time */
         delta_time_real = get_delta_time_real(start_time);
         syslog(LOG_INFO, "Processing Frame %d @ %lf", process_count, delta_time_real);
+        
+        /* Find best frame in raw_frame_bufs window */
+        process_img(selected_frame_bufs);
 
         process_count++;
-        
-        /* Find best frame in raw_ring_buf window */
-        best_frame_idx = process_img(raw_ring_buf);
-        if (best_frame_idx == -1) {
-            num_windows_skipped++;
-            if (num_windows_skipped == PROCESS_FREQ) {
-                best_frame_idx = (last_best_frame_idx + READ_FREQ) % ring_buf_size;
-                syslog(LOG_DEBUG, "Skipped %d windows; best_frame_idx = %lu\n",
-                        num_windows_skipped, best_frame_idx);
-            }
-            else {
-                continue;
-            }
-        }
-
-        /* Copy image to processed_ring_buf */
-        memcpy(&processed_ring_buf->p[processed_ring_buf->head],
-                &raw_ring_buf->p[best_frame_idx], sizeof(ring_buf_t));
-        processed_ring_buf->head = (processed_ring_buf->head + 1) % ring_buf_size;
-        
-        num_windows_skipped = 0;
-        last_best_frame_idx = best_frame_idx;
-
         if (process_count >= process_frames)
             break;
     }
@@ -1037,16 +1010,19 @@ void *process_img_thread(void *arg)
     *processing_finished = 1;
 }
 
-static size_t process_img(ring_buf_t *raw_ring_buf)
+static void process_img(struct ring_buf *selected_frame_bufs)
 {
+    struct v4l2_buffer buf;
     ssize_t best_frame_idx = -1;
     double percent_diff_threshold = 0.15;
     size_t i;
+    static int num_windows_skipped = 0;
+    static ssize_t last_best_frame_idx = 0;
 
     // Get percent diff between each consecutive pair of frames
     for (i = 0; i < READ_FREQ/PROCESS_FREQ; i++) {
-        size_t frame1_idx = (raw_ring_buf->tail + i) % ring_buf_size,
-               frame2_idx = (frame1_idx + 1) % ring_buf_size;
+        size_t frame1_idx = (raw_frame_bufs.tail + i) % raw_frame_bufs.size,
+               frame2_idx = (frame1_idx + 1) % raw_frame_bufs.size;
         double average_diff, percent_diff;
         size_t frame_size = HRES * VRES;
         size_t num_ys =  frame_size / 2;    // Assuming YUYV format
@@ -1057,8 +1033,8 @@ static size_t process_img(ring_buf_t *raw_ring_buf)
 
         // Find percent diff between bytes
         for (byte_idx = 0; byte_idx < frame_size; byte_idx++) {
-            frame1_val = raw_ring_buf->p[frame1_idx].p[byte_idx];
-            frame2_val = raw_ring_buf->p[frame2_idx].p[byte_idx];
+            frame1_val = raw_frame_bufs.start[frame1_idx].start[byte_idx];
+            frame2_val = raw_frame_bufs.start[frame2_idx].start[byte_idx];
             if (frame1_val < frame2_val)
                 sum += (frame2_val - frame1_val);
             else
@@ -1070,21 +1046,50 @@ static size_t process_img(ring_buf_t *raw_ring_buf)
         syslog(LOG_DEBUG, "frame1 = %d, frame2 = %d, percent_diff = %lf\n",
                 frame1_idx, frame2_idx, percent_diff);
 
-        // If tick, find best frame
+        // If tick detected, get best frame index
         if (percent_diff >= percent_diff_threshold) {
-            best_frame_idx = (frame1_idx + (READ_FREQ/PROCESS_FREQ)/2) % ring_buf_size;
+            best_frame_idx = (frame1_idx + (READ_FREQ/PROCESS_FREQ)/2) % raw_frame_bufs.size;
             break;
         }
     }
 
-    // Update raw_ring_buf tail
-    raw_ring_buf->tail = raw_ring_buf->tail + READ_FREQ/PROCESS_FREQ;
-    if (raw_ring_buf->tail >= ring_buf_size) {
-        raw_ring_buf->tail %= ring_buf_size;
-        raw_ring_buf->num_tail_wraps++;
+    // If no tick detected, get next best frame
+    if (best_frame_idx == -1) {
+        num_windows_skipped++;
+        if (num_windows_skipped == PROCESS_FREQ) {
+            best_frame_idx = (last_best_frame_idx + READ_FREQ) % raw_frame_bufs.size;
+            syslog(LOG_DEBUG, "Skipped %d windows; best_frame_idx = %lu\n",
+                    num_windows_skipped, best_frame_idx);
+        }
     }
 
-    return best_frame_idx;
+    // If best frame found, copy frame to selected_frame_bufs
+    if (best_frame_idx >= 0) {
+        memcpy(&selected_frame_bufs->start[selected_frame_bufs->head],
+                &raw_frame_bufs.start[best_frame_idx], sizeof(struct frame_buf));
+        selected_frame_bufs->head = (selected_frame_bufs->head + 1) % selected_frame_bufs->size;
+        
+        num_windows_skipped = 0;
+        last_best_frame_idx = best_frame_idx;
+    }
+
+    // Enqueue video frame buffers
+    for (i = 0; i < READ_FREQ/PROCESS_FREQ; i++) {
+        CLEAR(buf);
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = raw_frame_bufs.tail;
+        if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
+                errno_exit("VIDIOC_QBUF process_img");
+        syslog(LOG_DEBUG, "Enqueued index %d\n", buf.index);
+
+        // Update raw_frame_bufs tail position
+        raw_frame_bufs.tail++;
+        if (raw_frame_bufs.tail >= raw_frame_bufs.size) {
+            raw_frame_bufs.tail %= raw_frame_bufs.size;
+            raw_frame_bufs.tail_wraps++;
+        }
+    }
 }
 
 void *write_img_thread(void *arg)
@@ -1094,7 +1099,7 @@ void *write_img_thread(void *arg)
     struct write_thread_arg *targ = (struct write_thread_arg *)arg;
     sem_t *write_sem = targ->sem;
     uint8_t *write_finished = targ->finished;
-    ring_buf_t *processed_ring_buf = targ->processed_ring_buf;
+    struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
     int32_t write_count = -NUM_BIT_BUCKET_IMGS;
 
     // Write image service loop
@@ -1109,7 +1114,7 @@ void *write_img_thread(void *arg)
         if (write_count < 0) {
             syslog(LOG_INFO, "Bit-bucket frame %d\n", write_count);
 
-            processed_ring_buf->tail = (processed_ring_buf->tail + 1) % ring_buf_size;
+            selected_frame_bufs->tail = (selected_frame_bufs->tail + 1) % selected_frame_bufs->size;
             write_count++;
 
             continue;
@@ -1119,9 +1124,15 @@ void *write_img_thread(void *arg)
         delta_time_real = get_delta_time_real(start_time);
         syslog(LOG_INFO, "Writing Frame %d @ %lf", write_count, delta_time_real);
 
-        // Write image
-        write_img(&processed_ring_buf->p[processed_ring_buf->tail], write_count);
-        processed_ring_buf->tail = (processed_ring_buf->tail + 1) % ring_buf_size;
+        // Write image to memory
+        write_img(&selected_frame_bufs->start[selected_frame_bufs->tail], write_count);
+
+        // Update tail position
+        selected_frame_bufs->tail++;
+        if (selected_frame_bufs->tail >= selected_frame_bufs->size) {
+            selected_frame_bufs->tail %= selected_frame_bufs->size;
+            selected_frame_bufs->tail_wraps++;
+        }
 
         write_count++;
         if (write_count >= write_frames)
@@ -1131,12 +1142,12 @@ void *write_img_thread(void *arg)
     *write_finished = 1;
 }
 
-void write_img(img_buf_t *processed_img, int32_t write_count)
+void write_img(struct frame_buf *processed_img, int32_t write_count)
 {
     int r;
     int i, newi, newsize=0;
     int y_temp, y2_temp, u_temp, v_temp;
-    unsigned char *pptr = processed_img->p;
+    unsigned char *pptr = processed_img->start;
     int size = processed_img->bytesused;
     struct timeval timestamp = processed_img->timestamp;
     unsigned char bigbuffer[(1280*960)];
@@ -1193,10 +1204,10 @@ static void uninit_device(void)
         unsigned int i;
 
         for (i = 0; i < n_buffers; ++i)
-                if (-1 == munmap(buffers[i].start, buffers[i].length))
+                if (-1 == munmap(raw_frame_bufs.start[i].start, frame_buf_length))
                         errno_exit("munmap");
 
-        free(buffers);
+        free(raw_frame_bufs.start);
 }
 
 static void close_device(void)
