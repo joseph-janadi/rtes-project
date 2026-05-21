@@ -53,7 +53,7 @@
 #define VRES_STR "240"
 
 #define NUM_REQ_BUFS 32
-#define NUM_BIT_BUCKET_IMGS 10
+#define NUM_BIT_BUCKET_IMGS 0
 
 #define SCHED_POLICY SCHED_FIFO
 #define SEQ_CPU 2
@@ -266,9 +266,9 @@ int main(int argc, char **argv)
         }
     }
 
-    read_frames = READ_FREQ * frame_count;
-    process_frames = PROCESS_FREQ * frame_count;
-    write_frames = WRITE_FREQ * frame_count;
+    read_frames = READ_FREQ * (frame_count + 1);
+    process_frames = PROCESS_FREQ * (frame_count + 1);
+    write_frames = WRITE_FREQ * (frame_count + 1);
 
     open_device();
     init_device();
@@ -1088,7 +1088,7 @@ static void process_img(struct ring_buf *selected_frame_bufs)
     // If next best frame set, check if in current select window
     if (next_frame_idx >= 0)  {
         window_begin = raw_frame_bufs.tail;
-        window_end = window_begin + READ_FREQ/PROCESS_FREQ;
+        window_end = window_begin + READ_FREQ/PROCESS_FREQ - 1;
         if ((window_end < raw_frame_bufs.size)) {
             if ((next_frame_idx >= window_begin) && (next_frame_idx <= window_end))
                 copy = 1;
