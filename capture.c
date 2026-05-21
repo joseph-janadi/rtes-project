@@ -60,7 +60,7 @@
 #define SERVICE_CPU 3
 #define SEQ_FREQ 100
 #define READ_FREQ 20
-#define PROCESS_FREQ 5
+#define SELECT_FREQ 5
 #define WRITE_FREQ 1
 #define NSEC_PER_SEC 1000000000L
 #define NSEC_PER_USEC 1000L
@@ -120,21 +120,21 @@ struct ring_buf {
 struct seq_thread_arg {
     sem_t *seq_sem;
     sem_t *read_sem;
-    sem_t *process_sem;
+    sem_t *select_sem;
     sem_t *write_sem;
     uint8_t *read_finished;
-    uint8_t *processing_finished;
+    uint8_t *select_finished;
     uint8_t *write_finished;
 };
 struct read_thread_arg {
     sem_t *sem;
     uint8_t *finished;
 };
-struct process_thread_arg {
+struct select_thread_arg {
     sem_t *sem;
     struct ring_buf *selected_frame_bufs;
     uint8_t *read_finished;
-    uint8_t *processing_finished;
+    uint8_t *select_finished;
 };
 struct write_thread_arg {
     sem_t *sem;
@@ -160,7 +160,7 @@ static int              out_buf;
 static int              force_format=1;
 static int              frame_count = 180;
 
-static int read_frames, process_frames, write_frames;
+static int read_frames, select_frames, write_frames;
 struct timespec start_time;
 uint32_t frame_buf_length;
 
@@ -183,12 +183,12 @@ static void init_ring_buffer(struct ring_buf *selected_frame_bufs);
 static void free_ring_buffers(struct ring_buf *raw_ring_buf, struct ring_buf *selected_frame_bufs);
 static void timer_handler(union sigval arg);
 static void *sequencer(void *arg);
-void *read_img_thread(void *arg);
-static int read_img(int32_t read_count);
-void *process_img_thread(void *arg);
-static void process_img(struct ring_buf *selected_frame_bufs);
-void *write_img_thread(void *arg);
-void write_img(struct frame_buf *processed_img, int32_t write_count);
+void *read_frame_thread(void *arg);
+static int read_frame(int32_t read_count);
+void *select_frame_thread(void *arg);
+static void select_frame(struct ring_buf *selected_frame_bufs);
+void *write_frame_thread(void *arg);
+void write_frame(struct frame_buf *selected_frame, int32_t write_count);
 static void stop_capturing(void);
 static void uninit_device(void);
 static void close_device(void);
@@ -267,7 +267,7 @@ int main(int argc, char **argv)
     }
 
     read_frames = READ_FREQ * (frame_count + 1);
-    process_frames = PROCESS_FREQ * (frame_count + 1);
+    select_frames = SELECT_FREQ * (frame_count + 1);
     write_frames = WRITE_FREQ * (frame_count + 1);
 
     open_device();
@@ -522,14 +522,14 @@ static void run_threads(void)
     cpu_set_t cpu_set;
     int max_prio;
     struct sched_param s_param;
-    sem_t seq_sem, read_sem, process_sem, write_sem;
+    sem_t seq_sem, read_sem, select_sem, write_sem;
     pthread_attr_t thread_attr;
     struct seq_thread_arg seq_targ;
     struct read_thread_arg read_targ;
-    struct process_thread_arg process_targ;
+    struct select_thread_arg select_targ;
     struct write_thread_arg write_targ;
-    pthread_t seq_thread_id, read_thread_id, process_thread_id, write_thread_id;
-    uint8_t read_finished = 0, processing_finished = 0, write_finished = 0;
+    pthread_t seq_thread_id, read_thread_id, select_thread_id, write_thread_id;
+    uint8_t read_finished = 0, select_finished = 0, write_finished = 0;
 
     // Initialize the ring buffer
     init_ring_buffer(&selected_frame_bufs);
@@ -537,7 +537,7 @@ static void run_threads(void)
     // Initialize the semaphores
     r = sem_init(&seq_sem, 0, 0);
     r |= sem_init(&read_sem, 0, 0);
-    r |= sem_init(&process_sem, 0, 0);
+    r |= sem_init(&select_sem, 0, 0);
     r |= sem_init(&write_sem, 0, 0);
     if (r) {
         fprintf(stderr, "Error run_threads: Failed to initialize semaphores: %d, %s\n",
@@ -568,10 +568,10 @@ static void run_threads(void)
     }
     seq_targ.seq_sem = &seq_sem;
     seq_targ.read_sem = &read_sem;
-    seq_targ.process_sem = &process_sem;
+    seq_targ.select_sem = &select_sem;
     seq_targ.write_sem = &write_sem;
     seq_targ.read_finished = &read_finished;
-    seq_targ.processing_finished = &processing_finished;
+    seq_targ.select_finished = &select_finished;
     seq_targ.write_finished = &write_finished;
     pthread_create(&seq_thread_id, &thread_attr, sequencer, &seq_targ);
 
@@ -593,20 +593,20 @@ static void run_threads(void)
     }
     read_targ.sem = &read_sem;
     read_targ.finished = &read_finished;
-    pthread_create(&read_thread_id, &thread_attr, read_img_thread, &read_targ);
+    pthread_create(&read_thread_id, &thread_attr, read_frame_thread, &read_targ);
 
-    // Create the process thread
+    // Create the select thread
     s_param.sched_priority = max_prio - 1;
     r = pthread_attr_setschedparam(&thread_attr, &s_param);
     if (r) {
         fprintf(stderr, "Error run_threads: Failed to configure thread attributes\n");
         exit(EXIT_FAILURE);
     }
-    process_targ.sem = &process_sem;
-    process_targ.selected_frame_bufs = &selected_frame_bufs;
-    process_targ.read_finished = &read_finished;
-    process_targ.processing_finished = &processing_finished;
-    pthread_create(&process_thread_id, &thread_attr, process_img_thread, &process_targ);
+    select_targ.sem = &select_sem;
+    select_targ.selected_frame_bufs = &selected_frame_bufs;
+    select_targ.read_finished = &read_finished;
+    select_targ.select_finished = &select_finished;
+    pthread_create(&select_thread_id, &thread_attr, select_frame_thread, &select_targ);
 
     // Create the write thread
     s_param.sched_priority = max_prio - 2;
@@ -618,11 +618,11 @@ static void run_threads(void)
     write_targ.sem = &write_sem;
     write_targ.selected_frame_bufs = &selected_frame_bufs;
     write_targ.finished = &write_finished;
-    pthread_create(&write_thread_id, &thread_attr, write_img_thread, &write_targ);
+    pthread_create(&write_thread_id, &thread_attr, write_frame_thread, &write_targ);
 
     /* Wait for the threads to terminate */
     r = pthread_join(read_thread_id, NULL);
-    r |= pthread_join(process_thread_id, NULL);
+    r |= pthread_join(select_thread_id, NULL);
     r |= pthread_join(write_thread_id, NULL);
     r |= pthread_join(seq_thread_id, NULL);
     if (r) {
@@ -633,7 +633,7 @@ static void run_threads(void)
     // Destroy the semaphores
     r = sem_destroy(&seq_sem);
     r |= sem_destroy(&read_sem);
-    r |= sem_destroy(&process_sem);
+    r |= sem_destroy(&select_sem);
     r |= sem_destroy(&write_sem);
     if (r) {
         fprintf(stderr, "Error run_threads: Failed to destroy semaphores: %d, %s\n",
@@ -650,7 +650,7 @@ static void init_ring_buffer(struct ring_buf *selected_frame_bufs)
 {
     // Get necessary size of ring buffer
     size_t ring_buf_size;
-    ring_buf_size = frame_count - ((frame_count / PROCESS_FREQ) - 1) * WRITE_FREQ;
+    ring_buf_size = frame_count - ((frame_count / SELECT_FREQ) - 1) * WRITE_FREQ;
     ring_buf_size += NUM_BIT_BUCKET_IMGS;
     printf("selected_frame_bufs.size = %lu\n", ring_buf_size);
 
@@ -705,9 +705,9 @@ static void *sequencer(void *arg)
     int r;
     struct seq_thread_arg *targ = (struct seq_thread_arg *)arg;
     sem_t *seq_sem = targ->seq_sem, *read_sem = targ->read_sem,
-          *process_sem = targ->process_sem, *write_sem = targ->write_sem;
+          *select_sem = targ->select_sem, *write_sem = targ->write_sem;
     uint8_t *read_finished = targ->read_finished,
-            *processing_finished = targ->processing_finished,
+            *select_finished = targ->select_finished,
             *write_finished = targ->write_finished;
     pthread_attr_t timer_handler_attr;
     cpu_set_t cpu_set;
@@ -719,7 +719,7 @@ static void *sequencer(void *arg)
     struct itimerspec its = {{0, SEQ_PERIOD_NS}, {0, SEQ_PERIOD_NS}};
     uint32_t seq_count = 0;
     const uint8_t READ_RELEASE_FREQ = SEQ_FREQ/READ_FREQ,
-          PROCESS_RELEASE_FREQ = SEQ_FREQ/PROCESS_FREQ,
+          SELECT_RELEASE_FREQ = SEQ_FREQ/SELECT_FREQ,
           WRITE_RELEASE_FREQ = SEQ_FREQ/WRITE_FREQ;
 
     // Initialize timer handler pthread attributes
@@ -766,7 +766,7 @@ static void *sequencer(void *arg)
     }
 
     // Sequencer loop
-    while (!(*read_finished & *processing_finished & *write_finished)) {
+    while (!(*read_finished & *select_finished & *write_finished)) {
         seq_count++;
 
         // Wait for release by timer_handler
@@ -787,11 +787,11 @@ static void *sequencer(void *arg)
             }
         }
 
-        // Release process semaphore
-        if ((!*processing_finished) && (seq_count % PROCESS_RELEASE_FREQ == 0)) {
-            r = sem_post(process_sem);
+        // Release select semaphore
+        if ((!*select_finished) && (seq_count % SELECT_RELEASE_FREQ == 0)) {
+            r = sem_post(select_sem);
             if (r) {
-                fprintf(stderr, "Error sequencer: Failed to post process semaphore: %d, %s\n",
+                fprintf(stderr, "Error sequencer: Failed to post select semaphore: %d, %s\n",
                         errno, strerror(errno));
                 exit(EXIT_FAILURE);
             }
@@ -817,7 +817,7 @@ static void *sequencer(void *arg)
     }
 }
 
-void *read_img_thread(void *arg)
+void *read_frame_thread(void *arg)
 {
     double delta_time_real;
     struct read_thread_arg *targ = (struct read_thread_arg *)arg;
@@ -835,14 +835,14 @@ void *read_img_thread(void *arg)
     {
         // Wait for release by sequencer
         if (sem_wait(read_sem) == -1) {
-            fprintf(stderr, "Error read_img_thread: Failed to wait for read_sem: %d, %s\n",
+            fprintf(stderr, "Error read_frame_thread: Failed to wait for read_sem: %d, %s\n",
                     errno, strerror(errno));
             exit(EXIT_FAILURE);
         }
 
         // Log time
         delta_time_real = get_delta_time_real(start_time);
-        syslog(LOG_INFO, "Reading Frame %d @ %lf", read_count, delta_time_real);
+        syslog(LOG_INFO, "Read release %d @ %lf", read_count, delta_time_real);
 
         // Repeatedly call read() until succeeds
         for (;;)
@@ -874,7 +874,7 @@ void *read_img_thread(void *arg)
                 exit(EXIT_FAILURE);
             }
 
-            if (read_img(read_count))
+            if (read_frame(read_count))
             {
                 if(nanosleep(&read_delay, &time_error) != 0)
                     perror("nanosleep");
@@ -895,7 +895,7 @@ void *read_img_thread(void *arg)
     *read_finished = 1;
 }
 
-static int read_img(int32_t read_count)
+static int read_frame(int32_t read_count)
 {
     int r;
     struct v4l2_buffer buf;
@@ -927,12 +927,11 @@ static int read_img(int32_t read_count)
 
     // Check buffer index in range
     assert(buf.index < n_buffers);
-    syslog(LOG_DEBUG, "Dequeued index %d\n", buf.index);
 
     // Check for buffer overflow
     if ((raw_frame_bufs.head == raw_frame_bufs.tail) &&
             (raw_frame_bufs.head_wraps > raw_frame_bufs.tail_wraps)) {
-        fprintf(stderr, "Error read_img: Ring buffer overwrite\n");
+        fprintf(stderr, "Error read_frame: Ring buffer overwrite\n");
         exit(EXIT_FAILURE);
     }
 
@@ -952,44 +951,44 @@ static int read_img(int32_t read_count)
     return 1;
 }
 
-void *process_img_thread(void *arg)
+void *select_frame_thread(void *arg)
 {
     int r;
     double delta_time_real;
-    struct process_thread_arg *targ = (struct process_thread_arg *)arg;
-    sem_t *process_sem = targ->sem;
+    struct select_thread_arg *targ = (struct select_thread_arg *)arg;
+    sem_t *select_sem = targ->sem;
     struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
     uint8_t *read_finished = targ->read_finished,
-            *processing_finished = targ->processing_finished;
-    int32_t process_count = -NUM_BIT_BUCKET_IMGS;
+            *select_finished = targ->select_finished;
+    int32_t select_count = -NUM_BIT_BUCKET_IMGS;
     struct v4l2_buffer buf;
-    size_t process_window_head, process_window_tail;
+    size_t select_window_head, select_window_tail;
     ssize_t next_frame_idx;
 
     while (1) {
-        /* Wait for processing semaphore */
-        if (sem_wait(process_sem) == -1) {
-            fprintf(stderr, "Error process_img_thread: Failed to wait for process_sem: %d, %s\n",
+        /* Wait for select semaphore */
+        if (sem_wait(select_sem) == -1) {
+            fprintf(stderr, "Error select_frame_thread: Failed to wait for select_sem: %d, %s\n",
                     errno, strerror(errno));
             exit(EXIT_FAILURE);
         }
 
-        /* Check processing not ahead of reading */
+        /* Check select not ahead of reading */
         if (!*read_finished) {
-            process_window_head = raw_frame_bufs.tail;
-            process_window_tail = (process_window_head + READ_FREQ/PROCESS_FREQ) %
+            select_window_head = raw_frame_bufs.tail;
+            select_window_tail = (select_window_head + READ_FREQ/SELECT_FREQ) %
                 raw_frame_bufs.size;
-            if ((process_window_head <= raw_frame_bufs.head)
-                    && (process_window_tail >= raw_frame_bufs.head)) {
-                syslog(LOG_DEBUG, "Process window overtook read: ph = %d, pt = %d, r = %d\n",
-                        process_window_head, process_window_tail, raw_frame_bufs.head);
+            if ((select_window_head <= raw_frame_bufs.head)
+                    && (select_window_tail >= raw_frame_bufs.head)) {
+                syslog(LOG_DEBUG, "Select window overtook read: ph = %d, pt = %d, r = %d\n",
+                        select_window_head, select_window_tail, raw_frame_bufs.head);
                 continue;
             }
-            // Process window wrapped around ring buffer
-            if (process_window_tail < process_window_head) {
-                if ((process_window_head <= raw_frame_bufs.head)
-                        || (process_window_tail >= raw_frame_bufs.head)) {
-                    syslog(LOG_DEBUG, "Process window wrapped and overtook read\n");
+            // Select window wrapped around ring buffer
+            if (select_window_tail < select_window_head) {
+                if ((select_window_head <= raw_frame_bufs.head)
+                        || (select_window_tail >= raw_frame_bufs.head)) {
+                    syslog(LOG_DEBUG, "Select window wrapped and overtook read\n");
                     continue;
                 }
             }
@@ -997,20 +996,20 @@ void *process_img_thread(void *arg)
 
         /* Log time */
         delta_time_real = get_delta_time_real(start_time);
-        syslog(LOG_INFO, "Processing Frame %d @ %lf", process_count, delta_time_real);
+        syslog(LOG_INFO, "Select release %d @ %lf", select_count, delta_time_real);
         
         /* Find best frame in raw_frame_bufs window */
-        process_img(selected_frame_bufs);
+        select_frame(selected_frame_bufs);
 
-        process_count++;
-        if (process_count >= process_frames)
+        select_count++;
+        if (select_count >= select_frames)
             break;
     }
 
-    *processing_finished = 1;
+    *select_finished = 1;
 }
 
-static void process_img(struct ring_buf *selected_frame_bufs)
+static void select_frame(struct ring_buf *selected_frame_bufs)
 {
     struct v4l2_buffer buf;
     static ssize_t next_frame_idx = -1;
@@ -1024,7 +1023,7 @@ static void process_img(struct ring_buf *selected_frame_bufs)
     // If next best frame not found, look for next tick
     if (next_frame_idx == -1) {
         // Get percent diff between each consecutive pair of frames
-        for (i = 0; i < READ_FREQ/PROCESS_FREQ; i++) {
+        for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
             size_t frame1_idx = (raw_frame_bufs.tail + i) % raw_frame_bufs.size,
                    frame2_idx = (frame1_idx + 1) % raw_frame_bufs.size;
             double average_diff, percent_diff;
@@ -1060,7 +1059,7 @@ static void process_img(struct ring_buf *selected_frame_bufs)
         // If no tick detected within 1s, set next best frame
         if (next_frame_idx == -1) {
             num_windows_skipped++;
-            if (num_windows_skipped == PROCESS_FREQ) {
+            if (num_windows_skipped == SELECT_FREQ) {
                 next_frame_idx = (last_frame_idx + READ_FREQ) % raw_frame_bufs.size;
                 syslog(LOG_DEBUG, "Skipped %d windows; next_frame_idx = %lu\n",
                         num_windows_skipped, next_frame_idx);
@@ -1088,7 +1087,7 @@ static void process_img(struct ring_buf *selected_frame_bufs)
     // If next best frame set, check if in current select window
     if (next_frame_idx >= 0)  {
         window_begin = raw_frame_bufs.tail;
-        window_end = window_begin + READ_FREQ/PROCESS_FREQ - 1;
+        window_end = window_begin + READ_FREQ/SELECT_FREQ - 1;
         if ((window_end < raw_frame_bufs.size)) {
             if ((next_frame_idx >= window_begin) && (next_frame_idx <= window_end))
                 copy = 1;
@@ -1112,14 +1111,13 @@ static void process_img(struct ring_buf *selected_frame_bufs)
     }
 
     // Enqueue video frame buffers in current select window (except last)
-    for (i = 0; i < READ_FREQ/PROCESS_FREQ; i++) {
+    for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
         CLEAR(buf);
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index = raw_frame_bufs.tail;
         if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
-                errno_exit("VIDIOC_QBUF process_img");
-        syslog(LOG_DEBUG, "Enqueued index %d\n", buf.index);
+                errno_exit("VIDIOC_QBUF select_frame");
 
         // Update raw_frame_bufs tail position
         raw_frame_bufs.tail++;
@@ -1130,7 +1128,7 @@ static void process_img(struct ring_buf *selected_frame_bufs)
     }
 }
 
-void *write_img_thread(void *arg)
+void *write_frame_thread(void *arg)
 {
     int r;
     double delta_time_real;
@@ -1143,7 +1141,7 @@ void *write_img_thread(void *arg)
     // Write image service loop
     while (1) {
         if (sem_wait(write_sem) == -1) {
-            fprintf(stderr, "Error write_img_thread: Failed to wait for write_sem: %d, %s\n",
+            fprintf(stderr, "Error write_frame_thread: Failed to wait for write_sem: %d, %s\n",
                     errno, strerror(errno));
             exit(EXIT_FAILURE);
         }
@@ -1160,10 +1158,10 @@ void *write_img_thread(void *arg)
 
         /* Log time */
         delta_time_real = get_delta_time_real(start_time);
-        syslog(LOG_INFO, "Writing Frame %d @ %lf", write_count, delta_time_real);
+        syslog(LOG_INFO, "Write release %d @ %lf", write_count, delta_time_real);
 
         // Write image to memory
-        write_img(&selected_frame_bufs->start[selected_frame_bufs->tail], write_count);
+        write_frame(&selected_frame_bufs->start[selected_frame_bufs->tail], write_count);
 
         // Update tail position
         selected_frame_bufs->tail++;
@@ -1180,14 +1178,14 @@ void *write_img_thread(void *arg)
     *write_finished = 1;
 }
 
-void write_img(struct frame_buf *processed_img, int32_t write_count)
+void write_frame(struct frame_buf *selected_frame, int32_t write_count)
 {
     int r;
     int i, newi, newsize=0;
     int y_temp, y2_temp, u_temp, v_temp;
-    unsigned char *pptr = processed_img->start;
-    int size = processed_img->bytesused;
-    struct timeval timestamp = processed_img->timestamp;
+    unsigned char *pptr = selected_frame->start;
+    int size = selected_frame->bytesused;
+    struct timeval timestamp = selected_frame->timestamp;
     unsigned char bigbuffer[(1280*960)];
     struct timespec cur_time = {timestamp.tv_sec, timestamp.tv_usec * NSEC_PER_USEC};
 
