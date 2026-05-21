@@ -964,7 +964,7 @@ void *process_img_thread(void *arg)
     int32_t process_count = -NUM_BIT_BUCKET_IMGS;
     struct v4l2_buffer buf;
     size_t process_window_head, process_window_tail;
-    ssize_t best_frame_idx;
+    ssize_t next_frame_idx;
 
     while (1) {
         /* Wait for processing semaphore */
@@ -1013,67 +1013,105 @@ void *process_img_thread(void *arg)
 static void process_img(struct ring_buf *selected_frame_bufs)
 {
     struct v4l2_buffer buf;
-    ssize_t best_frame_idx = -1;
+    static ssize_t next_frame_idx = -1;
     double percent_diff_threshold = 0.15;
     size_t i;
     static int num_windows_skipped = 0;
-    static ssize_t last_best_frame_idx = 0;
+    static ssize_t last_frame_idx = 0;
+    int overwrite = 0, copy = 0;
+    int window_begin, window_end;
 
-    // Get percent diff between each consecutive pair of frames
-    for (i = 0; i < READ_FREQ/PROCESS_FREQ; i++) {
-        size_t frame1_idx = (raw_frame_bufs.tail + i) % raw_frame_bufs.size,
-               frame2_idx = (frame1_idx + 1) % raw_frame_bufs.size;
-        double average_diff, percent_diff;
-        size_t frame_size = HRES * VRES;
-        size_t num_ys =  frame_size / 2;    // Assuming YUYV format
-        uint32_t max_val = 255;
-        size_t byte_idx;
-        unsigned char frame1_val, frame2_val;
-        int64_t sum = 0;
+    // If next best frame not found, look for next tick
+    if (next_frame_idx == -1) {
+        // Get percent diff between each consecutive pair of frames
+        for (i = 0; i < READ_FREQ/PROCESS_FREQ; i++) {
+            size_t frame1_idx = (raw_frame_bufs.tail + i) % raw_frame_bufs.size,
+                   frame2_idx = (frame1_idx + 1) % raw_frame_bufs.size;
+            double average_diff, percent_diff;
+            size_t frame_size = HRES * VRES;
+            size_t num_ys =  frame_size / 2;    // Assuming YUYV format
+            uint32_t max_val = 255;
+            size_t byte_idx;
+            unsigned char frame1_val, frame2_val;
+            int64_t sum = 0;
 
-        // Find percent diff between bytes
-        for (byte_idx = 0; byte_idx < frame_size; byte_idx++) {
-            frame1_val = raw_frame_bufs.start[frame1_idx].start[byte_idx];
-            frame2_val = raw_frame_bufs.start[frame2_idx].start[byte_idx];
-            if (frame1_val < frame2_val)
-                sum += (frame2_val - frame1_val);
-            else
-                sum += (frame1_val - frame2_val);
+            // Find percent diff between bytes
+            for (byte_idx = 0; byte_idx < frame_size; byte_idx++) {
+                frame1_val = raw_frame_bufs.start[frame1_idx].start[byte_idx];
+                frame2_val = raw_frame_bufs.start[frame2_idx].start[byte_idx];
+                if (frame1_val < frame2_val)
+                    sum += (frame2_val - frame1_val);
+                else
+                    sum += (frame1_val - frame2_val);
+            }
+
+            average_diff = (double)sum / frame_size;
+            percent_diff = (average_diff / max_val) * 100;
+            syslog(LOG_DEBUG, "frame1 = %d, frame2 = %d, percent_diff = %lf\n",
+                    frame1_idx, frame2_idx, percent_diff);
+
+            // If tick detected, set next best frame
+            if (percent_diff >= percent_diff_threshold) {
+                next_frame_idx = (frame1_idx + (READ_FREQ / 2)) % raw_frame_bufs.size;
+                break;
+            }
         }
 
-        average_diff = (double)sum / frame_size;
-        percent_diff = (average_diff / max_val) * 100;
-        syslog(LOG_DEBUG, "frame1 = %d, frame2 = %d, percent_diff = %lf\n",
-                frame1_idx, frame2_idx, percent_diff);
-
-        // If tick detected, get best frame index
-        if (percent_diff >= percent_diff_threshold) {
-            best_frame_idx = (frame1_idx + (READ_FREQ/PROCESS_FREQ)/2) % raw_frame_bufs.size;
-            break;
+        // If no tick detected within 1s, set next best frame
+        if (next_frame_idx == -1) {
+            num_windows_skipped++;
+            if (num_windows_skipped == PROCESS_FREQ) {
+                next_frame_idx = (last_frame_idx + READ_FREQ) % raw_frame_bufs.size;
+                syslog(LOG_DEBUG, "Skipped %d windows; next_frame_idx = %lu\n",
+                        num_windows_skipped, next_frame_idx);
+            }
         }
-    }
-
-    // If no tick detected, get next best frame
-    if (best_frame_idx == -1) {
-        num_windows_skipped++;
-        if (num_windows_skipped == PROCESS_FREQ) {
-            best_frame_idx = (last_best_frame_idx + READ_FREQ) % raw_frame_bufs.size;
-            syslog(LOG_DEBUG, "Skipped %d windows; best_frame_idx = %lu\n",
-                    num_windows_skipped, best_frame_idx);
-        }
-    }
-
-    // If best frame found, copy frame to selected_frame_bufs
-    if (best_frame_idx >= 0) {
-        memcpy(&selected_frame_bufs->start[selected_frame_bufs->head],
-                &raw_frame_bufs.start[best_frame_idx], sizeof(struct frame_buf));
-        selected_frame_bufs->head = (selected_frame_bufs->head + 1) % selected_frame_bufs->size;
         
-        num_windows_skipped = 0;
-        last_best_frame_idx = best_frame_idx;
+        // If next best frame set, check if too close to last best frame
+        if (next_frame_idx >= 0) {
+            if (next_frame_idx < last_frame_idx) {
+                overwrite = ((((next_frame_idx + raw_frame_bufs.size) - last_frame_idx) %
+                        raw_frame_bufs.size) < (READ_FREQ / 2));
+            }
+            else {
+                overwrite = (((next_frame_idx - last_frame_idx) %
+                        raw_frame_bufs.size) < (READ_FREQ / 2));
+            }
+            // If best frames too close, decrement pointer to overwrite last copy
+            if (overwrite) {
+                selected_frame_bufs->head = (selected_frame_bufs->head - 1) %
+                    selected_frame_bufs->size;
+            }
+        }
     }
 
-    // Enqueue video frame buffers
+    // If next best frame set, check if in current select window
+    if (next_frame_idx >= 0)  {
+        window_begin = raw_frame_bufs.tail;
+        window_end = window_begin + READ_FREQ/PROCESS_FREQ;
+        if ((window_end < raw_frame_bufs.size)) {
+            if ((next_frame_idx >= window_begin) && (next_frame_idx <= window_end))
+                copy = 1;
+        }
+        // Window wrapped
+        else {
+            if ((next_frame_idx >= window_begin) || (next_frame_idx <= window_end))
+                copy = 1;
+        }
+        if (copy) {
+            // Copy frame
+            memcpy(&selected_frame_bufs->start[selected_frame_bufs->head],
+                    &raw_frame_bufs.start[next_frame_idx], sizeof(struct frame_buf));
+            selected_frame_bufs->head = (selected_frame_bufs->head + 1) %
+                selected_frame_bufs->size;
+            
+            num_windows_skipped = 0;
+            last_frame_idx = next_frame_idx;
+            next_frame_idx = -1;
+        }
+    }
+
+    // Enqueue video frame buffers in current select window (except last)
     for (i = 0; i < READ_FREQ/PROCESS_FREQ; i++) {
         CLEAR(buf);
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
