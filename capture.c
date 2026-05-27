@@ -53,11 +53,15 @@
 #define VRES_STR "240"
 
 #define NUM_REQ_BUFS 32
-#define NUM_BIT_BUCKET_IMGS 0
+#define NUM_BIT_BUCKETS 10
 
 #define SCHED_POLICY SCHED_FIFO
-#define SEQ_CPU 2
-#define SERVICE_CPU 3
+#define SEQ_CPU 1
+#define SERVICE_CPU 2
+#define TEST_CPU 3
+#define READ_CPU SERVICE_CPU
+#define SELECT_CPU SERVICE_CPU
+#define WRITE_CPU SERVICE_CPU
 #define SEQ_FREQ 100
 #define READ_FREQ 20
 #define SELECT_FREQ 5
@@ -184,7 +188,7 @@ static void free_ring_buffers(struct ring_buf *raw_ring_buf, struct ring_buf *se
 static void timer_handler(union sigval arg);
 static void *sequencer(void *arg);
 void *read_frame_thread(void *arg);
-static int read_frame(int32_t read_count);
+static int read_frame(void);
 void *select_frame_thread(void *arg);
 static void select_frame(struct ring_buf *selected_frame_bufs);
 void *write_frame_thread(void *arg);
@@ -201,7 +205,7 @@ static void dump_ppm(const void *p, int size, unsigned int tag, struct timespec 
 void yuv2rgb(int y, int u, int v, unsigned char *r, unsigned char *g, unsigned char *b);
 void yuv2rgb_float(float y, float u, float v, 
                    unsigned char *r, unsigned char *g, unsigned char *b);
-double get_delta_time_real(struct timespec prev_time);
+double get_delta_time_real(struct timespec cur_time, struct timespec prev_time);
 
 /******************************************************************************/
 // Function Definitions
@@ -266,8 +270,8 @@ int main(int argc, char **argv)
         }
     }
 
-    read_frames = READ_FREQ * (frame_count + 1);
-    select_frames = SELECT_FREQ * (frame_count + 1);
+    read_frames = READ_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS);
+    select_frames = SELECT_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS);
     write_frames = WRITE_FREQ * (frame_count + 1);
 
     open_device();
@@ -575,20 +579,14 @@ static void run_threads(void)
     seq_targ.write_finished = &write_finished;
     pthread_create(&seq_thread_id, &thread_attr, sequencer, &seq_targ);
 
-    // Assign all service threads to same core
-    CPU_ZERO(&cpu_set);
-    CPU_SET(SERVICE_CPU, &cpu_set);
-    r = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set), &cpu_set);
-    if (r) {
-        fprintf(stderr, "Error run_threads: Failed to configure thread attributes\n");
-        exit(EXIT_FAILURE);
-    }
-
     // Create the read thread
+    CPU_ZERO(&cpu_set);
+    CPU_SET(READ_CPU, &cpu_set);
+    r = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set), &cpu_set);
     s_param.sched_priority = max_prio;
-    r = pthread_attr_setschedparam(&thread_attr, &s_param);
+    r |= pthread_attr_setschedparam(&thread_attr, &s_param);
     if (r) {
-        fprintf(stderr, "Error run_threads: Failed to configure prio thread attribute\n");
+        fprintf(stderr, "Error run_threads: Failed to configure read thread attribute\n");
         exit(EXIT_FAILURE);
     }
     read_targ.sem = &read_sem;
@@ -596,10 +594,13 @@ static void run_threads(void)
     pthread_create(&read_thread_id, &thread_attr, read_frame_thread, &read_targ);
 
     // Create the select thread
+    CPU_ZERO(&cpu_set);
+    CPU_SET(SELECT_CPU, &cpu_set);
+    r = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set), &cpu_set);
     s_param.sched_priority = max_prio - 1;
-    r = pthread_attr_setschedparam(&thread_attr, &s_param);
+    r |= pthread_attr_setschedparam(&thread_attr, &s_param);
     if (r) {
-        fprintf(stderr, "Error run_threads: Failed to configure thread attributes\n");
+        fprintf(stderr, "Error run_threads: Failed to configure select thread attributes\n");
         exit(EXIT_FAILURE);
     }
     select_targ.sem = &select_sem;
@@ -609,10 +610,13 @@ static void run_threads(void)
     pthread_create(&select_thread_id, &thread_attr, select_frame_thread, &select_targ);
 
     // Create the write thread
+    CPU_ZERO(&cpu_set);
+    CPU_SET(WRITE_CPU, &cpu_set);
+    r = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set), &cpu_set);
     s_param.sched_priority = max_prio - 2;
-    r = pthread_attr_setschedparam(&thread_attr, &s_param);
+    r |= pthread_attr_setschedparam(&thread_attr, &s_param);
     if (r) {
-        fprintf(stderr, "Error run_threads: Failed to configure thread attributes\n");
+        fprintf(stderr, "Error run_threads: Failed to configure write thread attributes\n");
         exit(EXIT_FAILURE);
     }
     write_targ.sem = &write_sem;
@@ -645,13 +649,13 @@ static void run_threads(void)
     //free_ring_buffers(&raw_ring_buf, &selected_frame_bufs);
 }
 
-/* Allocates memory for the ring buffers */
+/* Allocates memory for the ring buffer */
 static void init_ring_buffer(struct ring_buf *selected_frame_bufs)
 {
     // Get necessary size of ring buffer
     size_t ring_buf_size;
     ring_buf_size = frame_count - ((frame_count / SELECT_FREQ) - 1) * WRITE_FREQ;
-    ring_buf_size += NUM_BIT_BUCKET_IMGS;
+    ring_buf_size += NUM_BIT_BUCKETS;
     printf("selected_frame_bufs.size = %lu\n", ring_buf_size);
 
     // Allocate ring buffer
@@ -682,7 +686,7 @@ static void init_ring_buffer(struct ring_buf *selected_frame_bufs)
     selected_frame_bufs->tail_wraps = 0;
 }
 
-/* TODO: Frees ring buffers memory */
+/* TODO: Frees ring buffer memory */
 static void free_ring_buffers(struct ring_buf *raw_ring_buf, struct ring_buf *selected_frame_bufs)
 {
 }
@@ -823,7 +827,8 @@ void *read_frame_thread(void *arg)
     struct read_thread_arg *targ = (struct read_thread_arg *)arg;
     sem_t *read_sem = targ->sem;
     uint8_t *read_finished = targ->finished;
-    int32_t read_count = -NUM_BIT_BUCKET_IMGS;
+    int32_t read_count = 0;
+    struct timespec service_release_time, service_response_time;
     struct timespec read_delay;
     struct timespec time_error;
 
@@ -840,8 +845,13 @@ void *read_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
 
-        // Log time
-        delta_time_real = get_delta_time_real(start_time);
+        // Log read service release time
+        if (clock_gettime(CLOCKID, &service_release_time) == -1) {
+            fprintf(stderr, "Error read_frame_thread: Failed to get thread start time: %d, %s\n",
+                    errno, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        delta_time_real = get_delta_time_real(service_release_time, start_time);
         syslog(LOG_INFO, "Read release %d @ %lf", read_count, delta_time_real);
 
         // Repeatedly call read() until succeeds
@@ -874,7 +884,7 @@ void *read_frame_thread(void *arg)
                 exit(EXIT_FAILURE);
             }
 
-            if (read_frame(read_count))
+            if (read_frame())
             {
                 if(nanosleep(&read_delay, &time_error) != 0)
                     perror("nanosleep");
@@ -890,12 +900,21 @@ void *read_frame_thread(void *arg)
 
         if(read_count >= read_frames)
             break;
+
+        // Log read service execution time
+        if (clock_gettime(CLOCKID, &service_response_time) == -1) {
+            fprintf(stderr, "Error read_frame_thread: Failed to get thread end time: %d, %s\n",
+                    errno, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        delta_time_real = get_delta_time_real(service_response_time, service_release_time);
+        syslog(LOG_DEBUG, "Read thread execution time %d = %lf", read_count, delta_time_real);
     }
 
     *read_finished = 1;
 }
 
-static int read_frame(int32_t read_count)
+static int read_frame(void)
 {
     int r;
     struct v4l2_buffer buf;
@@ -960,10 +979,11 @@ void *select_frame_thread(void *arg)
     struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
     uint8_t *read_finished = targ->read_finished,
             *select_finished = targ->select_finished;
-    int32_t select_count = -NUM_BIT_BUCKET_IMGS;
+    int32_t select_count = 0;
     struct v4l2_buffer buf;
     size_t select_window_head, select_window_tail;
     ssize_t next_frame_idx;
+    struct timespec service_release_time, service_response_time;
 
     while (1) {
         /* Wait for select semaphore */
@@ -972,6 +992,15 @@ void *select_frame_thread(void *arg)
                     errno, strerror(errno));
             exit(EXIT_FAILURE);
         }
+
+        // Log select service release time
+        if (clock_gettime(CLOCKID, &service_release_time) == -1) {
+            fprintf(stderr, "Error select_frame_thread: Failed to get thread start time: %d, %s\n",
+                    errno, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        delta_time_real = get_delta_time_real(service_release_time, start_time);
+        syslog(LOG_INFO, "Select release %d @ %lf", select_count, delta_time_real);
 
         /* Check select not ahead of reading */
         if (!*read_finished) {
@@ -993,10 +1022,6 @@ void *select_frame_thread(void *arg)
                 }
             }
         }
-
-        /* Log time */
-        delta_time_real = get_delta_time_real(start_time);
-        syslog(LOG_INFO, "Select release %d @ %lf", select_count, delta_time_real);
         
         /* Find best frame in raw_frame_bufs window */
         select_frame(selected_frame_bufs);
@@ -1004,6 +1029,15 @@ void *select_frame_thread(void *arg)
         select_count++;
         if (select_count >= select_frames)
             break;
+
+        // Log select service execution time
+        if (clock_gettime(CLOCKID, &service_response_time) == -1) {
+            fprintf(stderr, "Error select_frame_thread: Failed to get thread end time: %d, %s\n",
+                    errno, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        delta_time_real = get_delta_time_real(service_response_time, service_release_time);
+        syslog(LOG_DEBUG, "Select thread execution time %d = %lf", select_count, delta_time_real);
     }
 
     *select_finished = 1;
@@ -1013,21 +1047,22 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
 {
     struct v4l2_buffer buf;
     static ssize_t next_frame_idx = -1;
-    double percent_diff_threshold = 0.15;
+    double percent_diff_threshold = 0.08;
     size_t i;
     static int num_windows_skipped = 0;
     static ssize_t last_frame_idx = 0;
     int overwrite = 0, copy = 0;
     int window_begin, window_end;
 
-    // If next best frame not found, look for next tick
+    // If next best frame not set, look for next tick
     if (next_frame_idx == -1) {
-        // Get percent diff between each consecutive pair of frames
-        for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
+        // Detect tick: Get percent diff between each consecutive pair of frames
+        // in window
+        for (i = 0; i < READ_FREQ/SELECT_FREQ - 1; i++) {
             size_t frame1_idx = (raw_frame_bufs.tail + i) % raw_frame_bufs.size,
                    frame2_idx = (frame1_idx + 1) % raw_frame_bufs.size;
             double average_diff, percent_diff;
-            size_t frame_size = HRES * VRES;
+            size_t frame_size = HRES * VRES * 2;
             size_t num_ys =  frame_size / 2;    // Assuming YUYV format
             uint32_t max_val = 255;
             size_t byte_idx;
@@ -1066,6 +1101,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
             }
         }
         
+        /*
         // If next best frame set, check if too close to last best frame
         if (next_frame_idx >= 0) {
             if (next_frame_idx < last_frame_idx) {
@@ -1082,6 +1118,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
                     selected_frame_bufs->size;
             }
         }
+        */
     }
 
     // If next best frame set, check if in current select window
@@ -1136,7 +1173,8 @@ void *write_frame_thread(void *arg)
     sem_t *write_sem = targ->sem;
     uint8_t *write_finished = targ->finished;
     struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
-    int32_t write_count = -NUM_BIT_BUCKET_IMGS;
+    int32_t write_count = -NUM_BIT_BUCKETS;
+    struct timespec service_release_time, service_response_time;
 
     // Write image service loop
     while (1) {
@@ -1146,19 +1184,24 @@ void *write_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
 
+        // Log write service release time
+        if (clock_gettime(CLOCKID, &service_release_time) == -1) {
+            fprintf(stderr, "Error write_frame_thread: Failed to get thread start time: %d, %s\n",
+                    errno, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        delta_time_real = get_delta_time_real(service_release_time, start_time);
+        syslog(LOG_INFO, "Write release %d @ %lf", write_count, delta_time_real);
+
         // Bit-bucket first frames
         if (write_count < 0) {
             syslog(LOG_INFO, "Bit-bucket frame %d\n", write_count);
 
-            selected_frame_bufs->tail = (selected_frame_bufs->tail + 1) % selected_frame_bufs->size;
+            selected_frame_bufs->tail++;
             write_count++;
 
             continue;
         }
-
-        /* Log time */
-        delta_time_real = get_delta_time_real(start_time);
-        syslog(LOG_INFO, "Write release %d @ %lf", write_count, delta_time_real);
 
         // Write image to memory
         write_frame(&selected_frame_bufs->start[selected_frame_bufs->tail], write_count);
@@ -1173,6 +1216,15 @@ void *write_frame_thread(void *arg)
         write_count++;
         if (write_count >= write_frames)
             break;
+
+        // Log write service execution time
+        if (clock_gettime(CLOCKID, &service_response_time) == -1) {
+            fprintf(stderr, "Error write_frame_thread: Failed to get thread end time: %d, %s\n",
+                    errno, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        delta_time_real = get_delta_time_real(service_response_time, service_release_time);
+        syslog(LOG_DEBUG, "Write thread execution time %d = %lf", write_count, delta_time_real);
     }
 
     *write_finished = 1;
@@ -1398,19 +1450,11 @@ void yuv2rgb_float(float y, float u, float v,
     *b = b_temp > 255.0 ? 255 : (b_temp < 0.0 ? 0 : (unsigned char)b_temp);
 }
 
-double get_delta_time_real(struct timespec prev_time)
+double get_delta_time_real(struct timespec cur_time, struct timespec prev_time)
 {
     double delta_time_real;
-    struct timespec cur_time;
     time_t delta_sec;
     long delta_nsec;
-
-    // Get current time
-    if (clock_gettime(CLOCKID, &cur_time) == -1) {
-        fprintf(stderr, "Error get_delta_time_real: Failed to get cur time: %d, %s\n",
-                errno, strerror(errno));
-        exit(EXIT_FAILURE);
-    }
 
     delta_sec = cur_time.tv_sec - prev_time.tv_sec;
     delta_nsec = cur_time.tv_nsec - prev_time.tv_nsec;
