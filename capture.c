@@ -47,10 +47,10 @@
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 #define COLOR_CONVERT
-#define HRES 320
-#define VRES 240
-#define HRES_STR "320"
-#define VRES_STR "240"
+#define HRES 640
+#define VRES 480
+#define HRES_STR "640"
+#define VRES_STR "480"
 
 #define NUM_REQ_BUFS 32
 #define NUM_BIT_BUCKETS 10
@@ -62,7 +62,7 @@
 #define READ_CPU SERVICE_CPU
 #define SELECT_CPU SERVICE_CPU
 #define WRITE_CPU SERVICE_CPU
-#define SEQ_FREQ 100
+#define SEQ_FREQ 120
 #define READ_FREQ 20
 #define SELECT_FREQ 5
 #define WRITE_FREQ 1
@@ -1062,15 +1062,15 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
             size_t frame1_idx = (raw_frame_bufs.tail + i) % raw_frame_bufs.size,
                    frame2_idx = (frame1_idx + 1) % raw_frame_bufs.size;
             double average_diff, percent_diff;
-            size_t frame_size = HRES * VRES * 2;
-            size_t num_ys =  frame_size / 2;    // Assuming YUYV format
+            size_t num_bytes = HRES * VRES * 2;
+            size_t num_ys =  num_bytes / 2;    // Assuming YUYV format
             uint32_t max_val = 255;
             size_t byte_idx;
             unsigned char frame1_val, frame2_val;
             int64_t sum = 0;
 
             // Find percent diff between bytes
-            for (byte_idx = 0; byte_idx < frame_size; byte_idx++) {
+            for (byte_idx = 0; byte_idx < num_ys; byte_idx += 2) {
                 frame1_val = raw_frame_bufs.start[frame1_idx].start[byte_idx];
                 frame2_val = raw_frame_bufs.start[frame2_idx].start[byte_idx];
                 if (frame1_val < frame2_val)
@@ -1079,7 +1079,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
                     sum += (frame1_val - frame2_val);
             }
 
-            average_diff = (double)sum / frame_size;
+            average_diff = (double)sum / num_ys;
             percent_diff = (average_diff / max_val) * 100;
             syslog(LOG_DEBUG, "frame1 = %d, frame2 = %d, percent_diff = %lf\n",
                     frame1_idx, frame2_idx, percent_diff);
