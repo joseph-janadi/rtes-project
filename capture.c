@@ -97,12 +97,6 @@ enum io_method
         IO_METHOD_USERPTR,
 };
 
-struct buffer 
-{
-        void   *start;
-        size_t  length;
-};
-
 // Image buffer struct
 struct frame_buf {
     unsigned char *start;
@@ -438,21 +432,21 @@ static void init_mmap(void)
 
         if (-1 == xioctl(fd, VIDIOC_REQBUFS, &req)) 
         {
-                if (EINVAL == errno) 
-                {
-                        fprintf(stderr, "%s does not support "
-                                 "memory mapping\n", dev_name);
-                        exit(EXIT_FAILURE);
-                } else 
-                {
-                        errno_exit("VIDIOC_REQBUFS");
-                }
+            if (EINVAL == errno) 
+            {
+                fprintf(stderr, "%s does not support "
+                         "memory mapping\n", dev_name);
+                exit(EXIT_FAILURE);
+            } else 
+            {
+                errno_exit("VIDIOC_REQBUFS");
+            }
         }
 
         if (req.count < 2) 
         {
-                fprintf(stderr, "Insufficient buffer memory on %s\n", dev_name);
-                exit(EXIT_FAILURE);
+            fprintf(stderr, "Insufficient buffer memory on %s\n", dev_name);
+            exit(EXIT_FAILURE);
         }
 
         // Initialize raw_frame_bufs ring buffer
@@ -470,28 +464,28 @@ static void init_mmap(void)
 
         // Map device buffers into memory
         for (n_buffers = 0; n_buffers < req.count; ++n_buffers) {
-                struct v4l2_buffer buf;
+            struct v4l2_buffer buf;
 
-                CLEAR(buf);
+            CLEAR(buf);
 
-                buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                buf.memory      = V4L2_MEMORY_MMAP;
-                buf.index       = n_buffers;
+            buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory      = V4L2_MEMORY_MMAP;
+            buf.index       = n_buffers;
 
-                if (-1 == xioctl(fd, VIDIOC_QUERYBUF, &buf))
-                        errno_exit("VIDIOC_QUERYBUF");
+            if (-1 == xioctl(fd, VIDIOC_QUERYBUF, &buf))
+                    errno_exit("VIDIOC_QUERYBUF");
 
-                frame_buf_length = buf.length;
+            frame_buf_length = buf.length;
 
-                raw_frame_bufs.start[n_buffers].start =
-                        mmap(NULL /* start anywhere */,
-                              buf.length,
-                              PROT_READ | PROT_WRITE /* required */,
-                              MAP_SHARED /* recommended */,
-                              fd, buf.m.offset);
+            raw_frame_bufs.start[n_buffers].start =
+                    mmap(NULL /* start anywhere */,
+                          buf.length,
+                          PROT_READ | PROT_WRITE /* required */,
+                          MAP_SHARED /* recommended */,
+                          fd, buf.m.offset);
 
-                if (MAP_FAILED == raw_frame_bufs.start[n_buffers].start)
-                        errno_exit("mmap");
+            if (MAP_FAILED == raw_frame_bufs.start[n_buffers].start)
+                    errno_exit("mmap");
         }
 }
 
@@ -654,7 +648,7 @@ static void init_ring_buffer(struct ring_buf *selected_frame_bufs)
 {
     // Get necessary size of ring buffer
     size_t ring_buf_size;
-    ring_buf_size = frame_count - ((frame_count / SELECT_FREQ) - 1) * WRITE_FREQ;
+    ring_buf_size = frame_count - ((frame_count / READ_FREQ) - 1) * WRITE_FREQ;
     ring_buf_size += NUM_BIT_BUCKETS;
     printf("selected_frame_bufs.size = %lu\n", ring_buf_size);
 
@@ -950,7 +944,7 @@ static int read_frame(void)
     // Check for buffer overflow
     if ((raw_frame_bufs.head == raw_frame_bufs.tail) &&
             (raw_frame_bufs.head_wraps > raw_frame_bufs.tail_wraps)) {
-        fprintf(stderr, "Error read_frame: Ring buffer overwrite\n");
+        fprintf(stderr, "Error read_frame: Raw frame buffer overwrite\n");
         exit(EXIT_FAILURE);
     }
 
@@ -1002,7 +996,7 @@ void *select_frame_thread(void *arg)
         delta_time_real = get_delta_time_real(service_release_time, start_time);
         syslog(LOG_INFO, "Select release %d @ %lf", select_count, delta_time_real);
 
-        /* Check select not ahead of reading */
+        /* Check select not ahead of read */
         if (!*read_finished) {
             select_window_head = raw_frame_bufs.tail;
             select_window_tail = (select_window_head + READ_FREQ/SELECT_FREQ) %
@@ -1037,7 +1031,7 @@ void *select_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_response_time, service_release_time);
-        syslog(LOG_DEBUG, "Select thread execution time %d = %lf", select_count, delta_time_real);
+        syslog(LOG_DEBUG, "Select thread execution time %d = %lf", select_count-1, delta_time_real);
     }
 
     *select_finished = 1;
@@ -1047,7 +1041,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
 {
     struct v4l2_buffer buf;
     static ssize_t next_frame_idx = -1;
-    double percent_diff_threshold = 0.08;
+    double percent_diff_threshold = 0.04;
     size_t i;
     static int num_windows_skipped = 0;
     static ssize_t last_frame_idx = 0;
@@ -1070,7 +1064,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
             int64_t sum = 0;
 
             // Find percent diff between bytes
-            for (byte_idx = 0; byte_idx < num_ys; byte_idx += 2) {
+            for (byte_idx = 0; byte_idx < num_bytes; byte_idx += 2) {
                 frame1_val = raw_frame_bufs.start[frame1_idx].start[byte_idx];
                 frame2_val = raw_frame_bufs.start[frame2_idx].start[byte_idx];
                 if (frame1_val < frame2_val)
@@ -1079,7 +1073,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
                     sum += (frame1_val - frame2_val);
             }
 
-            average_diff = (double)sum / num_ys;
+            average_diff = (double)sum / num_bytes;
             percent_diff = (average_diff / max_val) * 100;
             syslog(LOG_DEBUG, "frame1 = %d, frame2 = %d, percent_diff = %lf\n",
                     frame1_idx, frame2_idx, percent_diff);
@@ -1135,6 +1129,12 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
                 copy = 1;
         }
         if (copy) {
+            // Check for ring buffer overwrite
+            if ((selected_frame_bufs->head == selected_frame_bufs->tail) &&
+                    (selected_frame_bufs->head_wraps > selected_frame_bufs->tail_wraps)) {
+                fprintf(stderr, "Error select_frame: Selected frame buffers overflow\n");
+                exit(EXIT_FAILURE);
+            }
             // Copy frame
             memcpy(&selected_frame_bufs->start[selected_frame_bufs->head],
                     &raw_frame_bufs.start[next_frame_idx], sizeof(struct frame_buf));
@@ -1192,6 +1192,12 @@ void *write_frame_thread(void *arg)
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
         syslog(LOG_INFO, "Write release %d @ %lf", write_count, delta_time_real);
+
+        // Check write not ahead of select
+        if (selected_frame_bufs->tail == selected_frame_bufs->head) {
+            fprintf(stderr, "Error write_frame_thread: Write overtook select\n");
+            exit(EXIT_FAILURE);
+        }
 
         // Bit-bucket first frames
         if (write_count < 0) {
