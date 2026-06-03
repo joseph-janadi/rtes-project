@@ -164,10 +164,10 @@ struct timespec start_time;
 uint32_t frame_buf_length;
 
 char pgm_header[]="P5\n#9999999999 sec 9999999999 msec \n"HRES_STR" "VRES_STR"\n255\n";
-char pgm_dumpname[]="test00000000.pgm";
+char pgm_dumpname[]="frames/test00000000.pgm";
 
 char ppm_header[]="P6\n#9999999999 sec 9999999999 msec \n"HRES_STR" "VRES_STR"\n255\n";
-char ppm_dumpname[]="test00000000.ppm";
+char ppm_dumpname[]="frames/test00000000.ppm";
 
 /******************************************************************************/
 // Function Prototypes
@@ -998,7 +998,7 @@ void *select_frame_thread(void *arg)
         delta_time_real = get_delta_time_real(service_release_time, start_time);
         syslog(LOG_INFO, "Select release %d @ %lf", select_count, delta_time_real);
 
-        /* Check select not ahead of read */
+        // If select overtook read, continue to next semaphore release
         if (!*read_finished) {
             select_window_head = raw_frame_bufs.tail;
             select_window_tail = (select_window_head + READ_FREQ/SELECT_FREQ) %
@@ -1195,7 +1195,7 @@ void *write_frame_thread(void *arg)
         delta_time_real = get_delta_time_real(service_release_time, start_time);
         syslog(LOG_INFO, "Write release %d @ %lf", write_count, delta_time_real);
 
-        // Check write not ahead of select
+        // If write overtook select, continue to next semaphore release 
         if ((!select_finished) && (selected_frame_bufs->tail == selected_frame_bufs->head)) {
             syslog(LOG_INFO, "Write %d overtook select %d\n", selected_frame_bufs->tail,
                     selected_frame_bufs->head);
@@ -1360,8 +1360,8 @@ static void dump_pgm(const void *p, int size, unsigned int tag, struct timespec 
 {
     int written, i, total, dumpfd;
    
-    snprintf(&pgm_dumpname[4], 9, "%08d", tag);
-    strncat(&pgm_dumpname[12], ".pgm", 5);
+    snprintf(&pgm_dumpname[11], 9, "%08d", tag);
+    strncat(&pgm_dumpname[19], ".pgm", 5);
     dumpfd = open(pgm_dumpname, O_WRONLY | O_NONBLOCK | O_CREAT, 00666);
 
     snprintf(&pgm_header[4], 11, "%010d", (int)time->tv_sec);
@@ -1390,8 +1390,8 @@ static void dump_ppm(const void *p, int size, unsigned int tag, struct timespec 
 {
     int written, i, total, dumpfd;
    
-    snprintf(&ppm_dumpname[4], 9, "%08d", tag);
-    strncat(&ppm_dumpname[12], ".ppm", 5);
+    snprintf(&ppm_dumpname[11], 9, "%08d", tag);
+    strncat(&ppm_dumpname[19], ".ppm", 5);
     dumpfd = open(ppm_dumpname, O_WRONLY | O_NONBLOCK | O_CREAT, 00666);
 
     snprintf(&ppm_header[4], 11, "%010d", (int)time->tv_sec);

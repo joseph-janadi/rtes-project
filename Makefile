@@ -21,7 +21,7 @@ TARGET = capture
 all: $(TARGET)
 
 clean:
-	-rm -f *.o *.d *.ppm *.pgm
+	-rm -f *.o *.d frames/*.ppm frames/*.pgm
 	-rm -f $(TARGET)
 
 capture: ${OBJS}
