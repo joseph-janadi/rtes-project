@@ -137,7 +137,8 @@ struct select_thread_arg {
 struct write_thread_arg {
     sem_t *sem;
     struct ring_buf *selected_frame_bufs;
-    uint8_t *finished;
+    uint8_t *select_finished;
+    uint8_t *write_finished;
 };
 
 /******************************************************************************/
@@ -615,7 +616,8 @@ static void run_threads(void)
     }
     write_targ.sem = &write_sem;
     write_targ.selected_frame_bufs = &selected_frame_bufs;
-    write_targ.finished = &write_finished;
+    write_targ.select_finished = &select_finished;
+    write_targ.write_finished = &write_finished;
     pthread_create(&write_thread_id, &thread_attr, write_frame_thread, &write_targ);
 
     /* Wait for the threads to terminate */
@@ -1041,7 +1043,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
 {
     struct v4l2_buffer buf;
     static ssize_t next_frame_idx = -1;
-    double percent_diff_threshold = 0.04;
+    double percent_diff_threshold = 0.50;
     size_t i;
     static int num_windows_skipped = 0;
     static ssize_t last_frame_idx = 0;
@@ -1050,8 +1052,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
 
     // If next best frame not set, look for next tick
     if (next_frame_idx == -1) {
-        // Detect tick: Get percent diff between each consecutive pair of frames
-        // in window
+        // Detect tick: Get percent diff between each consecutive pair of frames in window
         for (i = 0; i < READ_FREQ/SELECT_FREQ - 1; i++) {
             size_t frame1_idx = (raw_frame_bufs.tail + i) % raw_frame_bufs.size,
                    frame2_idx = (frame1_idx + 1) % raw_frame_bufs.size;
@@ -1064,7 +1065,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
             int64_t sum = 0;
 
             // Find percent diff between bytes
-            for (byte_idx = 0; byte_idx < num_bytes; byte_idx += 2) {
+            for (byte_idx = 0; byte_idx < num_bytes; byte_idx++) {
                 frame1_val = raw_frame_bufs.start[frame1_idx].start[byte_idx];
                 frame2_val = raw_frame_bufs.start[frame2_idx].start[byte_idx];
                 if (frame1_val < frame2_val)
@@ -1171,7 +1172,8 @@ void *write_frame_thread(void *arg)
     double delta_time_real;
     struct write_thread_arg *targ = (struct write_thread_arg *)arg;
     sem_t *write_sem = targ->sem;
-    uint8_t *write_finished = targ->finished;
+    uint8_t *select_finished = targ->select_finished;
+    uint8_t *write_finished = targ->write_finished;
     struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
     int32_t write_count = -NUM_BIT_BUCKETS;
     struct timespec service_release_time, service_response_time;
@@ -1194,9 +1196,10 @@ void *write_frame_thread(void *arg)
         syslog(LOG_INFO, "Write release %d @ %lf", write_count, delta_time_real);
 
         // Check write not ahead of select
-        if (selected_frame_bufs->tail == selected_frame_bufs->head) {
-            fprintf(stderr, "Error write_frame_thread: Write overtook select\n");
-            exit(EXIT_FAILURE);
+        if ((!select_finished) && (selected_frame_bufs->tail == selected_frame_bufs->head)) {
+            syslog(LOG_INFO, "Write %d overtook select %d\n", selected_frame_bufs->tail,
+                    selected_frame_bufs->head);
+            continue;
         }
 
         // Bit-bucket first frames
