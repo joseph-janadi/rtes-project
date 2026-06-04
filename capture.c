@@ -459,7 +459,7 @@ static void init_mmap(void)
         raw_frame_bufs.size = req.count;
         printf("raw_frame_bufs.size = %d\n", req.count);
         raw_frame_bufs.head = 0;
-        raw_frame_bufs.tail = 0;
+        raw_frame_bufs.tail = 1;    // Allows select to analyze whole window
         raw_frame_bufs.head_wraps = 0;
         raw_frame_bufs.tail_wraps = 0;
 
@@ -831,9 +831,49 @@ void *read_frame_thread(void *arg)
     read_delay.tv_sec=0;
     read_delay.tv_nsec=30000;
 
+    // Read first frame to allow select to analyze full window
+    // Repeatedly call read() until succeeds
+    for (;;) {
+        fd_set fds;
+        struct timeval tv;
+        int r;
+
+        FD_ZERO(&fds);
+        FD_SET(fd, &fds);
+
+        /* Timeout. */
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+
+        // Wait until camera device ready to read
+        r = select(fd + 1, &fds, NULL, NULL, &tv);
+
+        if (-1 == r) {
+            if (EINTR == errno)
+                continue;
+            errno_exit("select");
+        }
+
+        if (0 == r) {
+            fprintf(stderr, "select timeout\n");
+            exit(EXIT_FAILURE);
+        }
+
+        if (read_frame()) {
+            if(nanosleep(&read_delay, &time_error) != 0)
+                perror("nanosleep");
+
+            read_count++;
+
+            // Read succeeded
+            break;
+        }
+
+        // Read failed; try again
+    }
+
     // Service loop
-    while (1)
-    {
+    while (1) {
         // Wait for release by sequencer
         if (sem_wait(read_sem) == -1) {
             fprintf(stderr, "Error read_frame_thread: Failed to wait for read_sem: %d, %s\n",
@@ -851,8 +891,7 @@ void *read_frame_thread(void *arg)
         syslog(LOG_INFO, "Read release %d @ %lf", read_count, delta_time_real);
 
         // Repeatedly call read() until succeeds
-        for (;;)
-        {
+        for (;;) {
             fd_set fds;
             struct timeval tv;
             int r;
@@ -1043,7 +1082,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
 {
     struct v4l2_buffer buf;
     static ssize_t next_frame_idx = -1;
-    double percent_diff_threshold = 0.50;
+    double percent_diff_threshold = 0.10;
     size_t i;
     static int num_windows_skipped = 0;
     static ssize_t last_frame_idx = 0;
@@ -1052,9 +1091,10 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
 
     // If next best frame not set, look for next tick
     if (next_frame_idx == -1) {
-        // Detect tick: Get percent diff between each consecutive pair of frames in window
-        for (i = 0; i < READ_FREQ/SELECT_FREQ - 1; i++) {
-            size_t frame1_idx = (raw_frame_bufs.tail + i) % raw_frame_bufs.size,
+        // Detect tick: Get percent diff between each consecutive pair of frames in window,
+        // including last frame from previous window
+        for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
+            size_t frame1_idx = (raw_frame_bufs.tail + i - 1) % raw_frame_bufs.size,
                    frame2_idx = (frame1_idx + 1) % raw_frame_bufs.size;
             double average_diff, percent_diff;
             size_t num_bytes = HRES * VRES * 2;
@@ -1116,7 +1156,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
         */
     }
 
-    // If next best frame set, check if in current select window
+    // If next best frame set and in current select window, copy
     if (next_frame_idx >= 0)  {
         window_begin = raw_frame_bufs.tail;
         window_end = window_begin + READ_FREQ/SELECT_FREQ - 1;
@@ -1141,19 +1181,20 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
                     &raw_frame_bufs.start[next_frame_idx], sizeof(struct frame_buf));
             selected_frame_bufs->head = (selected_frame_bufs->head + 1) %
                 selected_frame_bufs->size;
-            
+
             num_windows_skipped = 0;
             last_frame_idx = next_frame_idx;
             next_frame_idx = -1;
         }
     }
 
-    // Enqueue video frame buffers in current select window (except last)
+    // Enqueue video frame buffers in current select window (except last frame)
+    // and last frame from previous window
     for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
         CLEAR(buf);
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = raw_frame_bufs.tail;
+        buf.index = (raw_frame_bufs.tail - 1 + raw_frame_bufs.size) % raw_frame_bufs.size;
         if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
                 errno_exit("VIDIOC_QBUF select_frame");
 
