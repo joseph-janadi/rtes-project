@@ -52,7 +52,7 @@
 #define HRES_STR "640"
 #define VRES_STR "480"
 
-#define NUM_REQ_BUFS 32
+#define NUM_REQ_BUFS 6
 #define NUM_BIT_BUCKETS 10
 
 #define SCHED_POLICY SCHED_FIFO
@@ -97,6 +97,13 @@ enum io_method
         IO_METHOD_USERPTR,
 };
 
+// Video capture buffer
+struct buffer 
+{
+        void   *start;
+        size_t  length;
+}; 
+
 // Image buffer struct
 struct frame_buf {
     unsigned char *start;
@@ -126,10 +133,12 @@ struct seq_thread_arg {
 };
 struct read_thread_arg {
     sem_t *sem;
+    struct ring_buf *raw_frame_bufs;
     uint8_t *finished;
 };
 struct select_thread_arg {
     sem_t *sem;
+    struct ring_buf *raw_frame_bufs;
     struct ring_buf *selected_frame_bufs;
     uint8_t *read_finished;
     uint8_t *select_finished;
@@ -150,10 +159,10 @@ static const char short_options[] = "d:hmruofc:";
 // Format is used by a number of functions, so made as a file global
 static struct v4l2_format fmt;
 
-static char            *dev_name;
+static char             *dev_name;
 static enum io_method   io = IO_METHOD_MMAP;
 static int              fd = -1;
-struct ring_buf         raw_frame_bufs;
+struct buffer           *buffers;
 static unsigned int     n_buffers;
 static int              out_buf;
 static int              force_format=1;
@@ -178,14 +187,14 @@ static void init_device(void);
 static void init_mmap(void);
 static void start_capturing(void);
 static void run_threads(void);
-static void init_ring_buffer(struct ring_buf *selected_frame_bufs);
+static void init_ring_buffer(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs);
 static void free_ring_buffers(struct ring_buf *raw_ring_buf, struct ring_buf *selected_frame_bufs);
 static void timer_handler(union sigval arg);
 static void *sequencer(void *arg);
 void *read_frame_thread(void *arg);
-static int read_frame(void);
+static int read_frame(struct ring_buf *raw_frame_bufs);
 void *select_frame_thread(void *arg);
-static void select_frame(struct ring_buf *selected_frame_bufs);
+static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs);
 void *write_frame_thread(void *arg);
 void write_frame(struct frame_buf *selected_frame, int32_t write_count);
 static void stop_capturing(void);
@@ -450,18 +459,14 @@ static void init_mmap(void)
             exit(EXIT_FAILURE);
         }
 
-        // Initialize raw_frame_bufs ring buffer
-        raw_frame_bufs.start = calloc(req.count, sizeof(struct frame_buf));
-        if (!raw_frame_bufs.start) {
-                fprintf(stderr, "Out of memory\n");
-                exit(EXIT_FAILURE);
+        // Initialize video buffer
+        buffers = calloc(req.count, sizeof(*buffers));
+
+        if (!buffers) 
+        {
+            fprintf(stderr, "Error init_mmap: Out of memory\n");
+            exit(EXIT_FAILURE);
         }
-        raw_frame_bufs.size = req.count;
-        printf("raw_frame_bufs.size = %d\n", req.count);
-        raw_frame_bufs.head = 0;
-        raw_frame_bufs.tail = 1;    // Allows select to analyze whole window
-        raw_frame_bufs.head_wraps = 0;
-        raw_frame_bufs.tail_wraps = 0;
 
         // Map device buffers into memory
         for (n_buffers = 0; n_buffers < req.count; ++n_buffers) {
@@ -478,14 +483,15 @@ static void init_mmap(void)
 
             frame_buf_length = buf.length;
 
-            raw_frame_bufs.start[n_buffers].start =
+            buffers[n_buffers].length = buf.length;
+            buffers[n_buffers].start  =
                     mmap(NULL /* start anywhere */,
                           buf.length,
                           PROT_READ | PROT_WRITE /* required */,
                           MAP_SHARED /* recommended */,
                           fd, buf.m.offset);
 
-            if (MAP_FAILED == raw_frame_bufs.start[n_buffers].start)
+            if (MAP_FAILED == buffers[n_buffers].start)
                     errno_exit("mmap");
         }
 }
@@ -517,7 +523,7 @@ static void start_capturing(void)
 static void run_threads(void)
 {
     int r;
-    struct ring_buf selected_frame_bufs;
+    struct ring_buf raw_frame_bufs, selected_frame_bufs;
     cpu_set_t cpu_set;
     int max_prio;
     struct sched_param s_param;
@@ -531,7 +537,7 @@ static void run_threads(void)
     uint8_t read_finished = 0, select_finished = 0, write_finished = 0;
 
     // Initialize the ring buffer
-    init_ring_buffer(&selected_frame_bufs);
+    init_ring_buffer(&raw_frame_bufs, &selected_frame_bufs);
 
     // Initialize the semaphores
     r = sem_init(&seq_sem, 0, 0);
@@ -585,6 +591,7 @@ static void run_threads(void)
         exit(EXIT_FAILURE);
     }
     read_targ.sem = &read_sem;
+    read_targ.raw_frame_bufs = &raw_frame_bufs;
     read_targ.finished = &read_finished;
     pthread_create(&read_thread_id, &thread_attr, read_frame_thread, &read_targ);
 
@@ -599,6 +606,7 @@ static void run_threads(void)
         exit(EXIT_FAILURE);
     }
     select_targ.sem = &select_sem;
+    select_targ.raw_frame_bufs = &raw_frame_bufs;
     select_targ.selected_frame_bufs = &selected_frame_bufs;
     select_targ.read_finished = &read_finished;
     select_targ.select_finished = &select_finished;
@@ -646,23 +654,46 @@ static void run_threads(void)
 }
 
 /* Allocates memory for the ring buffer */
-static void init_ring_buffer(struct ring_buf *selected_frame_bufs)
+static void init_ring_buffer(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs)
 {
-    // Get necessary size of ring buffer
-    size_t ring_buf_size;
-    ring_buf_size = frame_count - ((frame_count / READ_FREQ) - 1) * WRITE_FREQ;
-    ring_buf_size += NUM_BIT_BUCKETS;
-    printf("selected_frame_bufs.size = %lu\n", ring_buf_size);
+    size_t raw_ring_buf_size;
+    size_t selected_ring_buf_size;
+
+    // Allocate three window lengths to prevent overwrite
+    raw_ring_buf_size = (READ_FREQ/SELECT_FREQ) * 3;
+
+    // Allocate enough buffers to prevent overwrite
+    selected_ring_buf_size = frame_count - ((frame_count / READ_FREQ) - 1) * WRITE_FREQ;
+    selected_ring_buf_size += NUM_BIT_BUCKETS;
+    printf("selected_frame_bufs.size = %lu\n", selected_ring_buf_size);
 
     // Allocate ring buffer
-    selected_frame_bufs->start = (struct frame_buf *)malloc(ring_buf_size * sizeof(struct frame_buf));
+    raw_frame_bufs->start = (struct frame_buf *)malloc(raw_ring_buf_size * sizeof(struct frame_buf));
+    if (raw_frame_bufs->start == NULL) {
+        fprintf(stderr, "Error init_ring_buffers: Failed to allocate raw ring buffer\n");
+        exit(EXIT_FAILURE);
+    }
+    selected_frame_bufs->start = (struct frame_buf *)malloc(selected_ring_buf_size * sizeof(struct frame_buf));
     if (selected_frame_bufs->start == NULL) {
         fprintf(stderr, "Error init_ring_buffers: Failed to allocate write ring buffer\n");
         exit(EXIT_FAILURE);
     }
 
-    // Allocate image buffers within ring buffer
-    for (int i = 0; i < ring_buf_size; i++) {
+    // Allocate image buffers within ring buffers
+    for (int i = 0; i < raw_ring_buf_size; i++) {
+        raw_frame_bufs->start[i].start = (unsigned char *)malloc(frame_buf_length * sizeof(unsigned char));
+
+        if (raw_frame_bufs->start[i].start == NULL) {
+            fprintf(stderr, "Error init_ring_buffer: Failed to allocate image buffer within ring buffer\n");
+            for (int j = 0; j < i; j++) {
+                free(raw_frame_bufs->start[j].start);
+            }
+            free(raw_frame_bufs->start);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    for (int i = 0; i < selected_ring_buf_size; i++) {
         selected_frame_bufs->start[i].start = (unsigned char *)malloc(frame_buf_length * sizeof(unsigned char));
 
         if (selected_frame_bufs->start[i].start == NULL) {
@@ -675,7 +706,13 @@ static void init_ring_buffer(struct ring_buf *selected_frame_bufs)
         }
     }
 
-    selected_frame_bufs->size = ring_buf_size;
+    raw_frame_bufs->size = raw_ring_buf_size;
+    raw_frame_bufs->head = 0;
+    raw_frame_bufs->tail = 1;
+    raw_frame_bufs->head_wraps = 0;
+    raw_frame_bufs->tail_wraps = 0;
+
+    selected_frame_bufs->size = selected_ring_buf_size;
     selected_frame_bufs->head = 0;
     selected_frame_bufs->tail = 0;
     selected_frame_bufs->head_wraps = 0;
@@ -822,6 +859,7 @@ void *read_frame_thread(void *arg)
     double delta_time_real;
     struct read_thread_arg *targ = (struct read_thread_arg *)arg;
     sem_t *read_sem = targ->sem;
+    struct ring_buf *raw_frame_bufs = targ->raw_frame_bufs;
     uint8_t *read_finished = targ->finished;
     int32_t read_count = 0;
     struct timespec service_release_time, service_response_time;
@@ -830,47 +868,6 @@ void *read_frame_thread(void *arg)
 
     read_delay.tv_sec=0;
     read_delay.tv_nsec=30000;
-
-    // Read first frame to allow select to analyze full window
-    // Repeatedly call read() until succeeds
-    for (;;) {
-        fd_set fds;
-        struct timeval tv;
-        int r;
-
-        FD_ZERO(&fds);
-        FD_SET(fd, &fds);
-
-        /* Timeout. */
-        tv.tv_sec = 2;
-        tv.tv_usec = 0;
-
-        // Wait until camera device ready to read
-        r = select(fd + 1, &fds, NULL, NULL, &tv);
-
-        if (-1 == r) {
-            if (EINTR == errno)
-                continue;
-            errno_exit("select");
-        }
-
-        if (0 == r) {
-            fprintf(stderr, "select timeout\n");
-            exit(EXIT_FAILURE);
-        }
-
-        if (read_frame()) {
-            if(nanosleep(&read_delay, &time_error) != 0)
-                perror("nanosleep");
-
-            read_count++;
-
-            // Read succeeded
-            break;
-        }
-
-        // Read failed; try again
-    }
 
     // Service loop
     while (1) {
@@ -919,7 +916,7 @@ void *read_frame_thread(void *arg)
                 exit(EXIT_FAILURE);
             }
 
-            if (read_frame())
+            if (read_frame(raw_frame_bufs))
             {
                 if(nanosleep(&read_delay, &time_error) != 0)
                     perror("nanosleep");
@@ -949,7 +946,7 @@ void *read_frame_thread(void *arg)
     *read_finished = 1;
 }
 
-static int read_frame(void)
+static int read_frame(struct ring_buf *raw_frame_bufs)
 {
     int r;
     struct v4l2_buffer buf;
@@ -983,22 +980,30 @@ static int read_frame(void)
     assert(buf.index < n_buffers);
 
     // Check for buffer overflow
-    if ((raw_frame_bufs.head == raw_frame_bufs.tail) &&
-            (raw_frame_bufs.head_wraps > raw_frame_bufs.tail_wraps)) {
+    if ((raw_frame_bufs->head == raw_frame_bufs->tail) &&
+            (raw_frame_bufs->head_wraps > raw_frame_bufs->tail_wraps)) {
         fprintf(stderr, "Error read_frame: Raw frame buffer overwrite\n");
         exit(EXIT_FAILURE);
     }
 
+    // Copy frame from video buffer to raw_frame_bufs
+    memcpy(raw_frame_bufs->start[raw_frame_bufs->head].start,
+            buffers[buf.index].start, buf.bytesused);
+
     // Update frame buffer parameters
-    raw_frame_bufs.start[raw_frame_bufs.head].bytesused = buf.bytesused;
-    raw_frame_bufs.start[raw_frame_bufs.head].timestamp = buf.timestamp;
+    raw_frame_bufs->start[raw_frame_bufs->head].bytesused = buf.bytesused;
+    raw_frame_bufs->start[raw_frame_bufs->head].timestamp = buf.timestamp;
+
+    // Enqueue frame buffer
+    if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
+        errno_exit("VIDIOC_QBUF select_frame");
 
     // Increment head position
-    raw_frame_bufs.head++;
+    raw_frame_bufs->head++;
     // Check for wrap
-    if (raw_frame_bufs.head >= raw_frame_bufs.size) {
-        raw_frame_bufs.head = 0;
-        raw_frame_bufs.head_wraps++;
+    if (raw_frame_bufs->head >= raw_frame_bufs->size) {
+        raw_frame_bufs->head = 0;
+        raw_frame_bufs->head_wraps++;
     }
 
     //printf("R");
@@ -1011,12 +1016,13 @@ void *select_frame_thread(void *arg)
     double delta_time_real;
     struct select_thread_arg *targ = (struct select_thread_arg *)arg;
     sem_t *select_sem = targ->sem;
+    struct ring_buf *raw_frame_bufs = targ->raw_frame_bufs;
     struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
     uint8_t *read_finished = targ->read_finished,
             *select_finished = targ->select_finished;
     int32_t select_count = 0;
     struct v4l2_buffer buf;
-    size_t select_window_head, select_window_tail;
+    size_t window_head, window_tail;
     ssize_t next_frame_idx;
     struct timespec service_release_time, service_response_time;
 
@@ -1039,28 +1045,30 @@ void *select_frame_thread(void *arg)
 
         // If select overtook read, continue to next semaphore release
         if (!*read_finished) {
-            select_window_head = raw_frame_bufs.tail;
-            select_window_tail = (select_window_head + READ_FREQ/SELECT_FREQ) %
-                raw_frame_bufs.size;
-            if ((select_window_head <= raw_frame_bufs.head)
-                    && (select_window_tail >= raw_frame_bufs.head)) {
+            window_head = raw_frame_bufs->tail;
+            window_tail = (window_head + READ_FREQ/SELECT_FREQ) %
+                raw_frame_bufs->size;
+            if ((window_head <= raw_frame_bufs->head)
+                    && (window_tail >= raw_frame_bufs->head)) {
                 syslog(LOG_DEBUG, "Select window overtook read: ph = %d, pt = %d, r = %d\n",
-                        select_window_head, select_window_tail, raw_frame_bufs.head);
+                        window_head, window_tail, raw_frame_bufs->head);
                 continue;
             }
             // Select window wrapped around ring buffer
-            if (select_window_tail < select_window_head) {
-                if ((select_window_head <= raw_frame_bufs.head)
-                        || (select_window_tail >= raw_frame_bufs.head)) {
+            if (window_tail < window_head) {
+                if ((window_head <= raw_frame_bufs->head)
+                        || (window_tail >= raw_frame_bufs->head)) {
                     syslog(LOG_DEBUG, "Select window wrapped and overtook read\n");
                     continue;
                 }
             }
         }
         
-        /* Find best frame in raw_frame_bufs window */
-        select_frame(selected_frame_bufs);
+        // Find best frame in raw_frame_bufs window and copy to
+        // selected_frame_bufs
+        select_frame(raw_frame_bufs, selected_frame_bufs);
 
+        // Increment select count
         select_count++;
         if (select_count >= select_frames)
             break;
@@ -1078,7 +1086,7 @@ void *select_frame_thread(void *arg)
     *select_finished = 1;
 }
 
-static void select_frame(struct ring_buf *selected_frame_bufs)
+static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs)
 {
     struct v4l2_buffer buf;
     static ssize_t next_frame_idx = -1;
@@ -1094,8 +1102,8 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
         // Detect tick: Get percent diff between each consecutive pair of frames in window,
         // including last frame from previous window
         for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
-            size_t frame1_idx = (raw_frame_bufs.tail + i - 1) % raw_frame_bufs.size,
-                   frame2_idx = (frame1_idx + 1) % raw_frame_bufs.size;
+            size_t frame1_idx = (raw_frame_bufs->tail + i - 1) % raw_frame_bufs->size,
+                   frame2_idx = (frame1_idx + 1) % raw_frame_bufs->size;
             double average_diff, percent_diff;
             size_t num_bytes = HRES * VRES * 2;
             size_t num_ys =  num_bytes / 2;    // Assuming YUYV format
@@ -1106,8 +1114,8 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
 
             // Find percent diff between bytes
             for (byte_idx = 0; byte_idx < num_bytes; byte_idx++) {
-                frame1_val = raw_frame_bufs.start[frame1_idx].start[byte_idx];
-                frame2_val = raw_frame_bufs.start[frame2_idx].start[byte_idx];
+                frame1_val = raw_frame_bufs->start[frame1_idx].start[byte_idx];
+                frame2_val = raw_frame_bufs->start[frame2_idx].start[byte_idx];
                 if (frame1_val < frame2_val)
                     sum += (frame2_val - frame1_val);
                 else
@@ -1121,7 +1129,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
 
             // If tick detected, set next best frame
             if (percent_diff >= percent_diff_threshold) {
-                next_frame_idx = (frame1_idx + (READ_FREQ / 2)) % raw_frame_bufs.size;
+                next_frame_idx = (frame1_idx + (READ_FREQ / 2)) % raw_frame_bufs->size;
                 break;
             }
         }
@@ -1130,7 +1138,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
         if (next_frame_idx == -1) {
             num_windows_skipped++;
             if (num_windows_skipped == SELECT_FREQ) {
-                next_frame_idx = (last_frame_idx + READ_FREQ) % raw_frame_bufs.size;
+                next_frame_idx = (last_frame_idx + READ_FREQ) % raw_frame_bufs->size;
                 syslog(LOG_DEBUG, "Skipped %d windows; next_frame_idx = %lu\n",
                         num_windows_skipped, next_frame_idx);
             }
@@ -1140,12 +1148,12 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
         // If next best frame set, check if too close to last best frame
         if (next_frame_idx >= 0) {
             if (next_frame_idx < last_frame_idx) {
-                overwrite = ((((next_frame_idx + raw_frame_bufs.size) - last_frame_idx) %
-                        raw_frame_bufs.size) < (READ_FREQ / 2));
+                overwrite = ((((next_frame_idx + raw_frame_bufs->size) - last_frame_idx) %
+                        raw_frame_bufs->size) < (READ_FREQ / 2));
             }
             else {
                 overwrite = (((next_frame_idx - last_frame_idx) %
-                        raw_frame_bufs.size) < (READ_FREQ / 2));
+                        raw_frame_bufs->size) < (READ_FREQ / 2));
             }
             // If best frames too close, decrement pointer to overwrite last copy
             if (overwrite) {
@@ -1158,9 +1166,9 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
 
     // If next best frame set and in current select window, copy
     if (next_frame_idx >= 0)  {
-        window_begin = raw_frame_bufs.tail;
+        window_begin = raw_frame_bufs->tail;
         window_end = window_begin + READ_FREQ/SELECT_FREQ - 1;
-        if ((window_end < raw_frame_bufs.size)) {
+        if ((window_end < raw_frame_bufs->size)) {
             if ((next_frame_idx >= window_begin) && (next_frame_idx <= window_end))
                 copy = 1;
         }
@@ -1178,7 +1186,7 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
             }
             // Copy frame
             memcpy(&selected_frame_bufs->start[selected_frame_bufs->head],
-                    &raw_frame_bufs.start[next_frame_idx], sizeof(struct frame_buf));
+                    &raw_frame_bufs->start[next_frame_idx], sizeof(struct frame_buf));
             selected_frame_bufs->head = (selected_frame_bufs->head + 1) %
                 selected_frame_bufs->size;
 
@@ -1188,22 +1196,11 @@ static void select_frame(struct ring_buf *selected_frame_bufs)
         }
     }
 
-    // Enqueue video frame buffers in current select window (except last frame)
-    // and last frame from previous window
-    for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
-        CLEAR(buf);
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = (raw_frame_bufs.tail - 1 + raw_frame_bufs.size) % raw_frame_bufs.size;
-        if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
-                errno_exit("VIDIOC_QBUF select_frame");
-
-        // Update raw_frame_bufs tail position
-        raw_frame_bufs.tail++;
-        if (raw_frame_bufs.tail >= raw_frame_bufs.size) {
-            raw_frame_bufs.tail %= raw_frame_bufs.size;
-            raw_frame_bufs.tail_wraps++;
-        }
+    // Update raw_frame_bufs tail
+    raw_frame_bufs->tail += READ_FREQ/SELECT_FREQ;
+    if (raw_frame_bufs->tail >= raw_frame_bufs->size) {
+        raw_frame_bufs->tail %= raw_frame_bufs->size;
+        raw_frame_bufs->tail_wraps++;
     }
 }
 
@@ -1342,10 +1339,10 @@ static void uninit_device(void)
         unsigned int i;
 
         for (i = 0; i < n_buffers; ++i)
-                if (-1 == munmap(raw_frame_bufs.start[i].start, frame_buf_length))
-                        errno_exit("munmap");
+            if (-1 == munmap(buffers[i].start, frame_buf_length))
+                errno_exit("munmap");
 
-        free(raw_frame_bufs.start);
+        free(buffers);
 }
 
 static void close_device(void)
