@@ -1102,7 +1102,7 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
         // Detect tick: Get percent diff between each consecutive pair of frames in window,
         // including last frame from previous window
         for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
-            size_t frame1_idx = (raw_frame_bufs->tail + i - 1) % raw_frame_bufs->size,
+            size_t frame1_idx = (raw_frame_bufs->tail + i - 1 + raw_frame_bufs->size) % raw_frame_bufs->size,
                    frame2_idx = (frame1_idx + 1) % raw_frame_bufs->size;
             double average_diff, percent_diff;
             size_t num_bytes = HRES * VRES * 2;
