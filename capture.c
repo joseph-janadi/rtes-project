@@ -660,12 +660,13 @@ static void init_ring_buffer(struct ring_buf *raw_frame_bufs, struct ring_buf *s
     size_t selected_ring_buf_size;
 
     // Allocate three window lengths to prevent overwrite
-    raw_ring_buf_size = (READ_FREQ/SELECT_FREQ) * 3;
+    raw_ring_buf_size = READ_FREQ;
+    printf("raw_frame_bufs->size = %lu\n", raw_ring_buf_size);
 
     // Allocate enough buffers to prevent overwrite
     selected_ring_buf_size = frame_count - ((frame_count / READ_FREQ) - 1) * WRITE_FREQ;
     selected_ring_buf_size += NUM_BIT_BUCKETS;
-    printf("selected_frame_bufs.size = %lu\n", selected_ring_buf_size);
+    printf("selected_frame_bufs->size = %lu\n", selected_ring_buf_size);
 
     // Allocate ring buffer
     raw_frame_bufs->start = (struct frame_buf *)malloc(raw_ring_buf_size * sizeof(struct frame_buf));
@@ -940,7 +941,7 @@ void *read_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_response_time, service_release_time);
-        syslog(LOG_DEBUG, "Read thread execution time %d = %lf", read_count, delta_time_real);
+        //syslog(LOG_DEBUG, "Read thread execution time %d = %lf", read_count, delta_time_real);
     }
 
     *read_finished = 1;
@@ -1080,7 +1081,7 @@ void *select_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_response_time, service_release_time);
-        syslog(LOG_DEBUG, "Select thread execution time %d = %lf", select_count-1, delta_time_real);
+        //syslog(LOG_DEBUG, "Select thread execution time %d = %lf", select_count-1, delta_time_real);
     }
 
     *select_finished = 1;
@@ -1124,12 +1125,17 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
 
             average_diff = (double)sum / num_bytes;
             percent_diff = (average_diff / max_val) * 100;
+            /*
             syslog(LOG_DEBUG, "frame1 = %d, frame2 = %d, percent_diff = %lf\n",
                     frame1_idx, frame2_idx, percent_diff);
+            */
 
             // If tick detected, set next best frame
             if (percent_diff >= percent_diff_threshold) {
                 next_frame_idx = (frame1_idx + (READ_FREQ / 2)) % raw_frame_bufs->size;
+                syslog(LOG_DEBUG, "Window = %d..%d; Tick Index = %d; Selected Index = %d\n",
+                        raw_frame_bufs->tail, (raw_frame_bufs->tail + READ_FREQ/SELECT_FREQ - 1) % raw_frame_bufs->size,
+                        frame1_idx, next_frame_idx);
                 break;
             }
         }
@@ -1139,36 +1145,17 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
             num_windows_skipped++;
             if (num_windows_skipped == SELECT_FREQ) {
                 next_frame_idx = (last_frame_idx + READ_FREQ) % raw_frame_bufs->size;
-                syslog(LOG_DEBUG, "Skipped %d windows; next_frame_idx = %lu\n",
-                        num_windows_skipped, next_frame_idx);
+                syslog(LOG_DEBUG, "No Tick Detected; Selected Index = %d\n",
+                        next_frame_idx);
             }
         }
-        
-        /*
-        // If next best frame set, check if too close to last best frame
-        if (next_frame_idx >= 0) {
-            if (next_frame_idx < last_frame_idx) {
-                overwrite = ((((next_frame_idx + raw_frame_bufs->size) - last_frame_idx) %
-                        raw_frame_bufs->size) < (READ_FREQ / 2));
-            }
-            else {
-                overwrite = (((next_frame_idx - last_frame_idx) %
-                        raw_frame_bufs->size) < (READ_FREQ / 2));
-            }
-            // If best frames too close, decrement pointer to overwrite last copy
-            if (overwrite) {
-                selected_frame_bufs->head = (selected_frame_bufs->head - 1) %
-                    selected_frame_bufs->size;
-            }
-        }
-        */
     }
 
     // If next best frame set and in current select window, copy
     if (next_frame_idx >= 0)  {
         window_begin = raw_frame_bufs->tail;
-        window_end = window_begin + READ_FREQ/SELECT_FREQ - 1;
-        if ((window_end < raw_frame_bufs->size)) {
+        window_end = (window_begin + READ_FREQ/SELECT_FREQ - 1) % raw_frame_bufs->size;
+        if (window_end > window_begin) {
             if ((next_frame_idx >= window_begin) && (next_frame_idx <= window_end))
                 copy = 1;
         }
@@ -1185,6 +1172,8 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
                 exit(EXIT_FAILURE);
             }
             // Copy frame
+            syslog(LOG_DEBUG, "Window = %d..%d; Copying frame index %d\n",
+                    window_begin, window_end, next_frame_idx);
             memcpy(&selected_frame_bufs->start[selected_frame_bufs->head],
                     &raw_frame_bufs->start[next_frame_idx], sizeof(struct frame_buf));
             selected_frame_bufs->head = (selected_frame_bufs->head + 1) %
@@ -1271,7 +1260,7 @@ void *write_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_response_time, service_release_time);
-        syslog(LOG_DEBUG, "Write thread execution time %d = %lf", write_count, delta_time_real);
+        //syslog(LOG_DEBUG, "Write thread execution time %d = %lf", write_count, delta_time_real);
     }
 
     *write_finished = 1;
