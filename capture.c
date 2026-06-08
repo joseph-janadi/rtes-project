@@ -87,6 +87,7 @@ long_options[] = {
         { "output", no_argument,       NULL, 'o' },
         { "format", no_argument,       NULL, 'f' },
         { "count",  required_argument, NULL, 'c' },
+        { "rate",   required_argument, NULL, 'z' },
         { 0, 0, 0, 0 }
 };
 
@@ -154,12 +155,12 @@ struct write_thread_arg {
 // Globals
 /******************************************************************************/
 
-static const char short_options[] = "d:hmruofc:";
+static const char short_options[] = "d:hmruofc:z:";
 
 // Format is used by a number of functions, so made as a file global
 static struct v4l2_format fmt;
 
-static char             *dev_name;
+static char             *dev_name = "/dev/video0";
 static enum io_method   io = IO_METHOD_MMAP;
 static int              fd = -1;
 struct buffer           *buffers;
@@ -167,6 +168,8 @@ static unsigned int     n_buffers;
 static int              out_buf;
 static int              force_format=1;
 static int              frame_count = 180;
+
+static int rate = 1;
 
 static int read_frames, select_frames, write_frames;
 struct timespec start_time;
@@ -218,11 +221,6 @@ double get_delta_time_real(struct timespec cur_time, struct timespec prev_time);
 int main(int argc, char **argv)
 {
     syslog(LOG_INFO, "====================STARTING CAPTURE.C====================\n");
-    // Set dev_name
-    if(argc > 1)
-        dev_name = argv[1];
-    else
-        dev_name = "/dev/video0";
 
     // Get command-line options
     for (;;)
@@ -268,11 +266,21 @@ int main(int argc, char **argv)
                         errno_exit(optarg);
                 break;
 
+            case 'z':
+                rate = atoi(optarg);
+                if ((rate != 1) && (rate != 10)) {
+                    fprintf(stderr, "'--rate'/'-z' must be '1' or '10'\n");
+                    exit(EXIT_FAILURE);
+                }
+                break;
+
             default:
                 usage(stderr, argc, argv);
                 exit(EXIT_FAILURE);
         }
     }
+
+    printf("Capture rate = %d Hz\n", rate);
 
     read_frames = READ_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS);
     select_frames = SELECT_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS);
