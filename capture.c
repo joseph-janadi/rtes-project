@@ -1101,95 +1101,81 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
     static ssize_t next_frame_idx = -1;
     double percent_diff_threshold = 0.10;
     size_t i;
-    static int num_windows_skipped = 0;
+    static int num_frames_skipped = 0;
     static ssize_t last_frame_idx = 0;
-    int overwrite = 0, copy = 0;
-    int window_begin, window_end;
 
-    // If next best frame not set, look for next tick
-    if (next_frame_idx == -1) {
-        // Detect tick: Get percent diff between each consecutive pair of frames in window,
-        // including last frame from previous window
-        for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
-            size_t frame1_idx = (raw_frame_bufs->tail + i - 1 + raw_frame_bufs->size) % raw_frame_bufs->size,
-                   frame2_idx = (frame1_idx + 1) % raw_frame_bufs->size;
-            double average_diff, percent_diff;
-            size_t num_bytes = HRES * VRES * 2;
-            size_t num_ys =  num_bytes / 2;    // Assuming YUYV format
-            uint32_t max_val = 255;
-            size_t byte_idx;
-            unsigned char frame1_val, frame2_val;
-            int64_t sum = 0;
+    // Detect tick: Get percent diff between each consecutive pair of frames in window,
+    // including last frame from previous window
+    for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
+        size_t frame1_idx = (raw_frame_bufs->tail + i - 1 + raw_frame_bufs->size) % raw_frame_bufs->size,
+               frame2_idx = (frame1_idx + 1) % raw_frame_bufs->size;
+        double average_diff, percent_diff;
+        size_t num_bytes = HRES * VRES * 2;
+        size_t num_ys =  num_bytes / 2;    // Assuming YUYV format
+        uint32_t max_val = 255;
+        size_t byte_idx;
+        unsigned char frame1_val, frame2_val;
+        int64_t sum = 0;
 
-            // Find percent diff between bytes
-            for (byte_idx = 0; byte_idx < num_bytes; byte_idx++) {
-                frame1_val = raw_frame_bufs->start[frame1_idx].start[byte_idx];
-                frame2_val = raw_frame_bufs->start[frame2_idx].start[byte_idx];
-                if (frame1_val < frame2_val)
-                    sum += (frame2_val - frame1_val);
-                else
-                    sum += (frame1_val - frame2_val);
-            }
-
-            average_diff = (double)sum / num_bytes;
-            percent_diff = (average_diff / max_val) * 100;
-            /*
-            syslog(LOG_DEBUG, "frame1 = %d, frame2 = %d, percent_diff = %lf\n",
-                    frame1_idx, frame2_idx, percent_diff);
-            */
-
-            // If tick detected, set next best frame
-            if (percent_diff >= percent_diff_threshold) {
-                next_frame_idx = (frame1_idx + (READ_FREQ / 2)) % raw_frame_bufs->size;
-                syslog(LOG_DEBUG, "Window = %d..%d; Tick Index = %d; Selected Index = %d\n",
-                        raw_frame_bufs->tail, (raw_frame_bufs->tail + READ_FREQ/SELECT_FREQ - 1) % raw_frame_bufs->size,
-                        frame1_idx, next_frame_idx);
-                break;
-            }
-        }
-
-        // If no tick detected within 1s, set next best frame
-        if (next_frame_idx == -1) {
-            num_windows_skipped++;
-            if (num_windows_skipped == SELECT_FREQ) {
-                next_frame_idx = (last_frame_idx + READ_FREQ) % raw_frame_bufs->size;
-                syslog(LOG_DEBUG, "No Tick Detected; Selected Index = %d\n",
-                        next_frame_idx);
-            }
-        }
-    }
-
-    // If next best frame set and in current select window, copy
-    if (next_frame_idx >= 0)  {
-        window_begin = raw_frame_bufs->tail;
-        window_end = (window_begin + READ_FREQ/SELECT_FREQ - 1) % raw_frame_bufs->size;
-        if (window_end > window_begin) {
-            if ((next_frame_idx >= window_begin) && (next_frame_idx <= window_end))
-                copy = 1;
-        }
-        // Window wrapped
-        else {
-            if ((next_frame_idx >= window_begin) || (next_frame_idx <= window_end))
-                copy = 1;
-        }
-        if (copy) {
+        // If frame1 is the next best frame, copy
+        if (next_frame_idx == frame1_idx) {
             // Check for ring buffer overwrite
             if ((selected_frame_bufs->head == selected_frame_bufs->tail) &&
                     (selected_frame_bufs->head_wraps > selected_frame_bufs->tail_wraps)) {
                 fprintf(stderr, "Error select_frame: Selected frame buffers overflow\n");
                 exit(EXIT_FAILURE);
             }
+
             // Copy frame
-            syslog(LOG_DEBUG, "Window = %d..%d; Copying frame index %d\n",
-                    window_begin, window_end, next_frame_idx);
+            syslog(LOG_DEBUG, "Copying frame index %d\n", next_frame_idx);
             memcpy(&selected_frame_bufs->start[selected_frame_bufs->head],
                     &raw_frame_bufs->start[next_frame_idx], sizeof(struct frame_buf));
-            selected_frame_bufs->head = (selected_frame_bufs->head + 1) %
-                selected_frame_bufs->size;
+            selected_frame_bufs->head++;
+            if (selected_frame_bufs->head >= selected_frame_bufs->size) {
+                selected_frame_bufs->head %= selected_frame_bufs->size;
+                selected_frame_bufs->head_wraps++;
+            }
 
-            num_windows_skipped = 0;
+            num_frames_skipped = 0;
             last_frame_idx = next_frame_idx;
             next_frame_idx = -1;
+        }
+        // If next_frame_idx is set but not equal to frame1, continue
+        else if (next_frame_idx != -1) {
+            continue;
+        }
+
+        // Find percent diff between bytes
+        for (byte_idx = 0; byte_idx < num_bytes; byte_idx++) {
+            frame1_val = raw_frame_bufs->start[frame1_idx].start[byte_idx];
+            frame2_val = raw_frame_bufs->start[frame2_idx].start[byte_idx];
+            if (frame1_val < frame2_val)
+                sum += (frame2_val - frame1_val);
+            else
+                sum += (frame1_val - frame2_val);
+        }
+        average_diff = (double)sum / num_bytes;
+        percent_diff = (average_diff / max_val) * 100;
+        /*
+        syslog(LOG_DEBUG, "frame1 = %d, frame2 = %d, percent_diff = %lf\n",
+                frame1_idx, frame2_idx, percent_diff);
+        */
+
+        // If tick detected, set next best frame
+        if (percent_diff >= percent_diff_threshold) {
+            next_frame_idx = (frame1_idx + (READ_FREQ / (rate * 2))) % raw_frame_bufs->size;
+            syslog(LOG_DEBUG, "Window = %d..%d; Tick Index = %d; Selected Index = %d\n",
+                    raw_frame_bufs->tail, (raw_frame_bufs->tail + READ_FREQ/SELECT_FREQ - 1) % raw_frame_bufs->size,
+                    frame1_idx, next_frame_idx);
+        }
+        // If tick not detected, increment num_frames_skipped
+        else {
+            num_frames_skipped++;
+            // If too many frames skipped, set next_frame_idx based on last_frame_idx
+            if (num_frames_skipped == (READ_FREQ / rate)) {
+                next_frame_idx = (last_frame_idx + (READ_FREQ / rate)) % raw_frame_bufs->size;
+                syslog(LOG_DEBUG, "No Tick Detected; Selected Index = %d\n", next_frame_idx);
+            }
         }
     }
 
