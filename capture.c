@@ -63,7 +63,7 @@
 #define SELECT_CPU SERVICE_CPU
 #define WRITE_CPU SERVICE_CPU
 #define SEQ_FREQ 120
-#define READ_FREQ 20
+#define READ_FREQ 30
 #define SELECT_FREQ 5
 #define WRITE_FREQ 1
 #define NSEC_PER_SEC 1000000000L
@@ -282,8 +282,8 @@ int main(int argc, char **argv)
 
     printf("Capture rate = %d Hz\n", rate);
 
-    read_frames = READ_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS);
-    select_frames = SELECT_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS);
+    read_frames = READ_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS) / rate;
+    select_frames = SELECT_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS) / rate;
     write_frames = WRITE_FREQ * (frame_count + 1);
 
     open_device();
@@ -1099,10 +1099,16 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
 {
     struct v4l2_buffer buf;
     static ssize_t next_frame_idx = -1;
-    double percent_diff_threshold = 0.10;
+    double percent_diff_threshold;
     size_t i;
     static int num_frames_skipped = 0;
     static ssize_t last_frame_idx = 0;
+
+    // Adjust threshold to clock type
+    if (rate == 1)
+        percent_diff_threshold = 0.10;
+    else
+        percent_diff_threshold = 0.15;
 
     // Detect tick: Get percent diff between each consecutive pair of frames in window,
     // including last frame from previous window
@@ -1156,14 +1162,14 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
         }
         average_diff = (double)sum / num_bytes;
         percent_diff = (average_diff / max_val) * 100;
-        /*
+        
         syslog(LOG_DEBUG, "frame1 = %d, frame2 = %d, percent_diff = %lf\n",
                 frame1_idx, frame2_idx, percent_diff);
-        */
+        
 
         // If tick detected, set next best frame
         if (percent_diff >= percent_diff_threshold) {
-            next_frame_idx = (frame1_idx + (READ_FREQ / (rate * 2))) % raw_frame_bufs->size;
+            next_frame_idx = (frame1_idx + ((READ_FREQ / rate + 1) / 2)) % raw_frame_bufs->size;
             syslog(LOG_DEBUG, "Window = %d..%d; Tick Index = %d; Selected Index = %d\n",
                     raw_frame_bufs->tail, (raw_frame_bufs->tail + READ_FREQ/SELECT_FREQ - 1) % raw_frame_bufs->size,
                     frame1_idx, next_frame_idx);
@@ -1198,6 +1204,7 @@ void *write_frame_thread(void *arg)
     struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
     int32_t write_count = -NUM_BIT_BUCKETS;
     struct timespec service_release_time, service_response_time;
+    size_t window_head, window_tail;
 
     // Write image service loop
     while (1) {
@@ -1217,33 +1224,50 @@ void *write_frame_thread(void *arg)
         syslog(LOG_INFO, "Write release %d @ %lf", write_count, delta_time_real);
 
         // If write overtook select, continue to next semaphore release 
-        if ((!select_finished) && (selected_frame_bufs->tail == selected_frame_bufs->head)) {
-            syslog(LOG_INFO, "Write %d overtook select %d\n", selected_frame_bufs->tail,
-                    selected_frame_bufs->head);
-            continue;
+        if (!*select_finished) {
+            window_head = selected_frame_bufs->tail;
+            window_tail = (window_head + rate - 1) % selected_frame_bufs->size;
+            if ((window_head <= selected_frame_bufs->head)
+                    && (window_tail >= selected_frame_bufs->head)) {
+                syslog(LOG_DEBUG, "Write window overtook select: ph = %d, pt = %d, r = %d\n",
+                        window_head, window_tail, selected_frame_bufs->head);
+                continue;
+            }
+            // Select window wrapped around ring buffer
+            if (window_tail < window_head) {
+                if ((window_head <= selected_frame_bufs->head)
+                        || (window_tail >= selected_frame_bufs->head)) {
+                    syslog(LOG_DEBUG, "Write window wrapped and overtook select\n");
+                    continue;
+                }
+            }
         }
 
         // Bit-bucket first frames
         if (write_count < 0) {
             syslog(LOG_INFO, "Bit-bucket frame %d\n", write_count);
 
-            selected_frame_bufs->tail++;
-            write_count++;
+            selected_frame_bufs->tail += rate;
+            write_count += rate;
 
             continue;
         }
 
-        // Write image to memory
-        write_frame(&selected_frame_bufs->start[selected_frame_bufs->tail], write_count);
+        // Write rate number of image to memory
+        for (int i = 0; i < rate; i++) {
+            write_frame(&selected_frame_bufs->start[selected_frame_bufs->tail], write_count);
 
-        // Update tail position
-        selected_frame_bufs->tail++;
-        if (selected_frame_bufs->tail >= selected_frame_bufs->size) {
-            selected_frame_bufs->tail %= selected_frame_bufs->size;
-            selected_frame_bufs->tail_wraps++;
+            selected_frame_bufs->tail++;
+            if (selected_frame_bufs->tail >= selected_frame_bufs->size) {
+                selected_frame_bufs->tail %= selected_frame_bufs->size;
+                selected_frame_bufs->tail_wraps++;
+            }
+
+            write_count++;
+            if (write_count >= write_frames)
+                break;
         }
 
-        write_count++;
         if (write_count >= write_frames)
             break;
 
