@@ -53,7 +53,7 @@
 #define VRES_STR "480"
 
 #define NUM_REQ_BUFS 6
-#define NUM_BIT_BUCKETS 10
+//#define NUM_BIT_BUCKETS 10
 
 #define SCHED_POLICY SCHED_FIFO
 #define SEQ_CPU 1
@@ -63,7 +63,7 @@
 #define SELECT_CPU SERVICE_CPU
 #define WRITE_CPU SERVICE_CPU
 #define SEQ_FREQ 120
-#define READ_FREQ 30
+//#define READ_FREQ 20
 #define SELECT_FREQ 5
 #define WRITE_FREQ 1
 #define NSEC_PER_SEC 1000000000L
@@ -109,7 +109,7 @@ struct buffer
 struct frame_buf {
     unsigned char *start;
     size_t bytesused;
-    struct timeval timestamp;
+    struct timespec timestamp;
 };
 
 // Ring buffer struct
@@ -170,6 +170,8 @@ static int              force_format=1;
 static int              frame_count = 180;
 
 static int rate = 1;
+static int READ_FREQ = 20;
+static int NUM_BIT_BUCKETS;
 
 static int read_frames, select_frames, write_frames;
 struct timespec start_time;
@@ -195,7 +197,7 @@ static void free_ring_buffers(struct ring_buf *raw_ring_buf, struct ring_buf *se
 static void timer_handler(union sigval arg);
 static void *sequencer(void *arg);
 void *read_frame_thread(void *arg);
-static int read_frame(struct ring_buf *raw_frame_bufs);
+static int read_frame(struct ring_buf *raw_frame_bufs, struct timespec capture_time);
 void *select_frame_thread(void *arg);
 static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs);
 void *write_frame_thread(void *arg);
@@ -220,6 +222,22 @@ double get_delta_time_real(struct timespec cur_time, struct timespec prev_time);
 
 int main(int argc, char **argv)
 {
+    FILE *pp;
+    char *cpu_info = NULL;
+    size_t len = 0;
+
+    // Log processor info
+    if ((pp = popen("uname -a", "r")) == NULL) {
+       perror("Error opening pipe");
+       exit(1);
+    }   
+    if (getline(&cpu_info, &len, pp) == -1) {
+       perror("Error getting cpu info");
+       exit(1);
+    }   
+    syslog(LOG_CRIT, "[Course#:4][Final Project]: %s", cpu_info);
+    free(cpu_info);
+
     syslog(LOG_INFO, "====================STARTING CAPTURE.C====================\n");
 
     // Get command-line options
@@ -268,7 +286,12 @@ int main(int argc, char **argv)
 
             case 'z':
                 rate = atoi(optarg);
-                if ((rate != 1) && (rate != 10)) {
+                // Adjust READ_FREQ based on rate
+                if (rate == 1)
+                    READ_FREQ = 20;
+                else if (rate == 10)
+                    READ_FREQ = 30;
+                else {
                     fprintf(stderr, "'--rate'/'-z' must be '1' or '10'\n");
                     exit(EXIT_FAILURE);
                 }
@@ -281,6 +304,8 @@ int main(int argc, char **argv)
     }
 
     printf("Capture rate = %d Hz\n", rate);
+
+    NUM_BIT_BUCKETS = READ_FREQ;
 
     read_frames = READ_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS) / rate;
     select_frames = SELECT_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS) / rate;
@@ -667,13 +692,12 @@ static void init_ring_buffer(struct ring_buf *raw_frame_bufs, struct ring_buf *s
     size_t raw_ring_buf_size;
     size_t selected_ring_buf_size;
 
-    // Allocate three window lengths to prevent overwrite
-    raw_ring_buf_size = READ_FREQ;
+    // Allocate multiple window lengths to prevent overwrite
+    raw_ring_buf_size = READ_FREQ/SELECT_FREQ * 5;
     printf("raw_frame_bufs->size = %lu\n", raw_ring_buf_size);
 
     // Allocate enough buffers to prevent overwrite
-    selected_ring_buf_size = frame_count - ((frame_count / READ_FREQ) - 1) * WRITE_FREQ;
-    selected_ring_buf_size += NUM_BIT_BUCKETS;
+    selected_ring_buf_size = frame_count + NUM_BIT_BUCKETS;
     printf("selected_frame_bufs->size = %lu\n", selected_ring_buf_size);
 
     // Allocate ring buffer
@@ -895,6 +919,8 @@ void *read_frame_thread(void *arg)
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
         syslog(LOG_INFO, "Read release %d @ %lf", read_count, delta_time_real);
+        syslog(LOG_CRIT, "[Course #:4] [Final Project] [Frame Count: %d] "
+                "[Image Capture Start Time: %lf seconds]\n", read_count, delta_time_real);
 
         // Repeatedly call read() until succeeds
         for (;;) {
@@ -925,7 +951,7 @@ void *read_frame_thread(void *arg)
                 exit(EXIT_FAILURE);
             }
 
-            if (read_frame(raw_frame_bufs))
+            if (read_frame(raw_frame_bufs, service_release_time))
             {
                 if(nanosleep(&read_delay, &time_error) != 0)
                     perror("nanosleep");
@@ -955,7 +981,7 @@ void *read_frame_thread(void *arg)
     *read_finished = 1;
 }
 
-static int read_frame(struct ring_buf *raw_frame_bufs)
+static int read_frame(struct ring_buf *raw_frame_bufs, struct timespec capture_time)
 {
     int r;
     struct v4l2_buffer buf;
@@ -1001,7 +1027,7 @@ static int read_frame(struct ring_buf *raw_frame_bufs)
 
     // Update frame buffer parameters
     raw_frame_bufs->start[raw_frame_bufs->head].bytesused = buf.bytesused;
-    raw_frame_bufs->start[raw_frame_bufs->head].timestamp = buf.timestamp;
+    raw_frame_bufs->start[raw_frame_bufs->head].timestamp = capture_time;
 
     // Enqueue frame buffer
     if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
@@ -1253,7 +1279,7 @@ void *write_frame_thread(void *arg)
             continue;
         }
 
-        // Write rate number of image to memory
+        // Write rate number of images to memory
         for (int i = 0; i < rate; i++) {
             write_frame(&selected_frame_bufs->start[selected_frame_bufs->tail], write_count);
 
@@ -1291,9 +1317,8 @@ void write_frame(struct frame_buf *selected_frame, int32_t write_count)
     int y_temp, y2_temp, u_temp, v_temp;
     unsigned char *pptr = selected_frame->start;
     int size = selected_frame->bytesused;
-    struct timeval timestamp = selected_frame->timestamp;
+    struct timespec cur_time = selected_frame->timestamp;
     unsigned char bigbuffer[(1280*960)];
-    struct timespec cur_time = {timestamp.tv_sec, timestamp.tv_usec * NSEC_PER_USEC};
 
     /* Dump frame */
     if (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV) {
