@@ -173,7 +173,6 @@ static int rate = 1;
 static int READ_FREQ = 20;
 static int NUM_BIT_BUCKETS;
 
-static int read_frames, select_frames, write_frames;
 struct timespec start_time;
 uint32_t frame_buf_length;
 
@@ -199,7 +198,7 @@ static void *sequencer(void *arg);
 void *read_frame_thread(void *arg);
 static int read_frame(struct ring_buf *raw_frame_bufs, struct timespec capture_time);
 void *select_frame_thread(void *arg);
-static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs);
+static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs, int *select_count);
 void *write_frame_thread(void *arg);
 void write_frame(struct frame_buf *selected_frame, int32_t write_count);
 static void stop_capturing(void);
@@ -306,10 +305,6 @@ int main(int argc, char **argv)
     printf("Capture rate = %d Hz\n", rate);
 
     NUM_BIT_BUCKETS = READ_FREQ;
-
-    read_frames = READ_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS) / rate;
-    select_frames = SELECT_FREQ * (frame_count + 1 + NUM_BIT_BUCKETS) / rate;
-    write_frames = WRITE_FREQ * (frame_count + 1);
 
     open_device();
     init_device();
@@ -693,11 +688,11 @@ static void init_ring_buffer(struct ring_buf *raw_frame_bufs, struct ring_buf *s
     size_t selected_ring_buf_size;
 
     // Allocate multiple window lengths to prevent overwrite
-    raw_ring_buf_size = READ_FREQ/SELECT_FREQ * 5;
+    raw_ring_buf_size = READ_FREQ * 3;
     printf("raw_frame_bufs->size = %lu\n", raw_ring_buf_size);
 
     // Allocate enough buffers to prevent overwrite
-    selected_ring_buf_size = frame_count + NUM_BIT_BUCKETS;
+    selected_ring_buf_size = frame_count + 1 + NUM_BIT_BUCKETS;
     printf("selected_frame_bufs->size = %lu\n", selected_ring_buf_size);
 
     // Allocate ring buffer
@@ -894,6 +889,7 @@ void *read_frame_thread(void *arg)
     sem_t *read_sem = targ->sem;
     struct ring_buf *raw_frame_bufs = targ->raw_frame_bufs;
     uint8_t *read_finished = targ->finished;
+    int read_frames = READ_FREQ/rate * (frame_count + 1 + NUM_BIT_BUCKETS) + 1; // TODO: Need + 1?
     int32_t read_count = 0;
     struct timespec service_release_time, service_response_time;
     struct timespec read_delay;
@@ -918,7 +914,7 @@ void *read_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
-        syslog(LOG_INFO, "Read release %d @ %lf", read_count, delta_time_real);
+        syslog(LOG_INFO, "S1 %d @ %lf", read_count, delta_time_real);
         syslog(LOG_CRIT, "[Course #:4] [Final Project] [Frame Count: %d] "
                 "[Image Capture Start Time: %lf seconds]\n", read_count, delta_time_real);
 
@@ -956,14 +952,14 @@ void *read_frame_thread(void *arg)
                 if(nanosleep(&read_delay, &time_error) != 0)
                     perror("nanosleep");
 
-                read_count++;
-
                 // Read succeeded
                 break;
             }
 
             // Read failed; try again
         }
+
+        read_count++;
 
         if(read_count >= read_frames)
             break;
@@ -1022,6 +1018,8 @@ static int read_frame(struct ring_buf *raw_frame_bufs, struct timespec capture_t
     }
 
     // Copy frame from video buffer to raw_frame_bufs
+    syslog(LOG_DEBUG, "Read from camera index %d to raw index %d\n",
+            buf.index, raw_frame_bufs->head);
     memcpy(raw_frame_bufs->start[raw_frame_bufs->head].start,
             buffers[buf.index].start, buf.bytesused);
 
@@ -1055,7 +1053,9 @@ void *select_frame_thread(void *arg)
     struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
     uint8_t *read_finished = targ->read_finished,
             *select_finished = targ->select_finished;
-    int32_t select_count = 0;
+    int select_frames = frame_count + 1;
+    int32_t select_count = -NUM_BIT_BUCKETS;
+    int select_release = 0;
     struct v4l2_buffer buf;
     size_t window_head, window_tail;
     ssize_t next_frame_idx;
@@ -1068,15 +1068,6 @@ void *select_frame_thread(void *arg)
                     errno, strerror(errno));
             exit(EXIT_FAILURE);
         }
-
-        // Log select service release time
-        if (clock_gettime(CLOCKID, &service_release_time) == -1) {
-            fprintf(stderr, "Error select_frame_thread: Failed to get thread start time: %d, %s\n",
-                    errno, strerror(errno));
-            exit(EXIT_FAILURE);
-        }
-        delta_time_real = get_delta_time_real(service_release_time, start_time);
-        syslog(LOG_INFO, "Select release %d @ %lf", select_count, delta_time_real);
 
         // If select overtook read, continue to next semaphore release
         if (!*read_finished) {
@@ -1093,18 +1084,27 @@ void *select_frame_thread(void *arg)
             if (window_tail < window_head) {
                 if ((window_head <= raw_frame_bufs->head)
                         || (window_tail >= raw_frame_bufs->head)) {
-                    syslog(LOG_DEBUG, "Select window wrapped and overtook read\n");
+                    syslog(LOG_DEBUG, "Select window overtook read: ph = %d, pt = %d, r = %d\n",
+                            window_head, window_tail, raw_frame_bufs->head);
                     continue;
                 }
             }
         }
         
+        // Log select service release time
+        if (clock_gettime(CLOCKID, &service_release_time) == -1) {
+            fprintf(stderr, "Error select_frame_thread: Failed to get thread start time: %d, %s\n",
+                    errno, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        delta_time_real = get_delta_time_real(service_release_time, start_time);
+        syslog(LOG_INFO, "S2 %d @ %lf", select_release, delta_time_real);
+
         // Find best frame in raw_frame_bufs window and copy to
         // selected_frame_bufs
-        select_frame(raw_frame_bufs, selected_frame_bufs);
+        select_frame(raw_frame_bufs, selected_frame_bufs, &select_count);
 
         // Increment select count
-        select_count++;
         if (select_count >= select_frames)
             break;
 
@@ -1121,7 +1121,7 @@ void *select_frame_thread(void *arg)
     *select_finished = 1;
 }
 
-static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs)
+static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs, int *select_count)
 {
     struct v4l2_buffer buf;
     static ssize_t next_frame_idx = -1;
@@ -1137,9 +1137,9 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
         percent_diff_threshold = 0.15;
 
     // Detect tick: Get percent diff between each consecutive pair of frames in window,
-    // including last frame from previous window
+    // including first frame from next window
     for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
-        size_t frame1_idx = (raw_frame_bufs->tail + i - 1 + raw_frame_bufs->size) % raw_frame_bufs->size,
+        size_t frame1_idx = (raw_frame_bufs->tail + i) % raw_frame_bufs->size,
                frame2_idx = (frame1_idx + 1) % raw_frame_bufs->size;
         double average_diff, percent_diff;
         size_t num_bytes = HRES * VRES * 2;
@@ -1159,7 +1159,8 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
             }
 
             // Copy frame
-            syslog(LOG_DEBUG, "Copying frame index %d\n", next_frame_idx);
+            syslog(LOG_DEBUG, "Selecting from raw index %d to selected index %d\n",
+                    next_frame_idx, selected_frame_bufs->head);
             memcpy(&selected_frame_bufs->start[selected_frame_bufs->head],
                     &raw_frame_bufs->start[next_frame_idx], sizeof(struct frame_buf));
             selected_frame_bufs->head++;
@@ -1167,6 +1168,8 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
                 selected_frame_bufs->head %= selected_frame_bufs->size;
                 selected_frame_bufs->head_wraps++;
             }
+
+            (*select_count)++;
 
             num_frames_skipped = 0;
             last_frame_idx = next_frame_idx;
@@ -1188,10 +1191,8 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
         }
         average_diff = (double)sum / num_bytes;
         percent_diff = (average_diff / max_val) * 100;
-        
         syslog(LOG_DEBUG, "frame1 = %d, frame2 = %d, percent_diff = %lf\n",
                 frame1_idx, frame2_idx, percent_diff);
-        
 
         // If tick detected, set next best frame
         if (percent_diff >= percent_diff_threshold) {
@@ -1228,7 +1229,9 @@ void *write_frame_thread(void *arg)
     uint8_t *select_finished = targ->select_finished;
     uint8_t *write_finished = targ->write_finished;
     struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
+    int write_frames = frame_count + 1;
     int32_t write_count = -NUM_BIT_BUCKETS;
+    int write_release = 0;
     struct timespec service_release_time, service_response_time;
     size_t window_head, window_tail;
 
@@ -1239,15 +1242,6 @@ void *write_frame_thread(void *arg)
                     errno, strerror(errno));
             exit(EXIT_FAILURE);
         }
-
-        // Log write service release time
-        if (clock_gettime(CLOCKID, &service_release_time) == -1) {
-            fprintf(stderr, "Error write_frame_thread: Failed to get thread start time: %d, %s\n",
-                    errno, strerror(errno));
-            exit(EXIT_FAILURE);
-        }
-        delta_time_real = get_delta_time_real(service_release_time, start_time);
-        syslog(LOG_INFO, "Write release %d @ %lf", write_count, delta_time_real);
 
         // If write overtook select, continue to next semaphore release 
         if (!*select_finished) {
@@ -1269,6 +1263,16 @@ void *write_frame_thread(void *arg)
             }
         }
 
+        // Log write service release time
+        if (clock_gettime(CLOCKID, &service_release_time) == -1) {
+            fprintf(stderr, "Error write_frame_thread: Failed to get thread start time: %d, %s\n",
+                    errno, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        delta_time_real = get_delta_time_real(service_release_time, start_time);
+        syslog(LOG_INFO, "S3 %d @ %lf", write_release, delta_time_real);
+        write_release++;
+
         // Bit-bucket first frames
         if (write_count < 0) {
             syslog(LOG_INFO, "Bit-bucket frame %d\n", write_count);
@@ -1281,6 +1285,7 @@ void *write_frame_thread(void *arg)
 
         // Write rate number of images to memory
         for (int i = 0; i < rate; i++) {
+            syslog(LOG_DEBUG, "Writing from selected index %d\n", selected_frame_bufs->tail);
             write_frame(&selected_frame_bufs->start[selected_frame_bufs->tail], write_count);
 
             selected_frame_bufs->tail++;
