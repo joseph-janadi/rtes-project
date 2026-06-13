@@ -736,7 +736,7 @@ static void init_ring_buffer(struct ring_buf *raw_frame_bufs, struct ring_buf *s
 
     raw_frame_bufs->size = raw_ring_buf_size;
     raw_frame_bufs->head = 0;
-    raw_frame_bufs->tail = 1;
+    raw_frame_bufs->tail = 0;
     raw_frame_bufs->head_wraps = 0;
     raw_frame_bufs->tail_wraps = 0;
 
@@ -889,7 +889,7 @@ void *read_frame_thread(void *arg)
     sem_t *read_sem = targ->sem;
     struct ring_buf *raw_frame_bufs = targ->raw_frame_bufs;
     uint8_t *read_finished = targ->finished;
-    int read_frames = READ_FREQ/rate * (frame_count + 1 + NUM_BIT_BUCKETS) + 1; // TODO: Need + 1?
+    int read_frames = READ_FREQ/rate * (frame_count + 1 + NUM_BIT_BUCKETS);
     int32_t read_count = 0;
     struct timespec service_release_time, service_response_time;
     struct timespec read_delay;
@@ -1099,6 +1099,7 @@ void *select_frame_thread(void *arg)
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
         syslog(LOG_INFO, "S2 %d @ %lf", select_release, delta_time_real);
+        select_release++;
 
         // Find best frame in raw_frame_bufs window and copy to
         // selected_frame_bufs
