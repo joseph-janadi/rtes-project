@@ -135,7 +135,8 @@ struct seq_thread_arg {
 struct read_thread_arg {
     sem_t *sem;
     struct ring_buf *raw_frame_bufs;
-    uint8_t *finished;
+    uint8_t *read_finished;
+    uint8_t *select_finished;
 };
 struct select_thread_arg {
     sem_t *sem;
@@ -620,7 +621,8 @@ static void run_threads(void)
     }
     read_targ.sem = &read_sem;
     read_targ.raw_frame_bufs = &raw_frame_bufs;
-    read_targ.finished = &read_finished;
+    read_targ.read_finished = &read_finished;
+    read_targ.select_finished = &select_finished;
     pthread_create(&read_thread_id, &thread_attr, read_frame_thread, &read_targ);
 
     // Create the select thread
@@ -888,7 +890,8 @@ void *read_frame_thread(void *arg)
     struct read_thread_arg *targ = (struct read_thread_arg *)arg;
     sem_t *read_sem = targ->sem;
     struct ring_buf *raw_frame_bufs = targ->raw_frame_bufs;
-    uint8_t *read_finished = targ->finished;
+    uint8_t *read_finished = targ->read_finished;
+    uint8_t *select_finished = targ->select_finished;
     int read_frames = READ_FREQ/rate * (frame_count + 1 + NUM_BIT_BUCKETS);
     int32_t read_count = 0;
     struct timespec service_release_time, service_response_time;
@@ -915,8 +918,10 @@ void *read_frame_thread(void *arg)
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
         syslog(LOG_INFO, "S1 %d @ %lf", read_count, delta_time_real);
-        syslog(LOG_CRIT, "[Course #:4] [Final Project] [Frame Count: %d] "
-                "[Image Capture Start Time: %lf seconds]\n", read_count, delta_time_real);
+
+        // If select finished, break
+        if (*select_finished)
+            break;
 
         // Repeatedly call read() until succeeds
         for (;;) {
@@ -1283,6 +1288,11 @@ void *write_frame_thread(void *arg)
 
             continue;
         }
+
+        int sec = service_release_time.tv_sec - start_time.tv_sec;
+        int dsec = (service_release_time.tv_nsec - start_time.tv_nsec) / 100000000;
+        syslog(LOG_CRIT, "[Course #:4] [Final Project] [Frame Count: %d] "
+                "[Image Capture Start Time: %d.%d seconds]\n", write_count, sec, dsec);
 
         // Write rate number of images to memory
         for (int i = 0; i < rate; i++) {
