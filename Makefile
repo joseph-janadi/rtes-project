@@ -13,7 +13,7 @@ endif
 ifeq ($(INFO), 1)
 	CFLAGS += -DINFO
 endif
-LDFLAGS = -lrt -lpthread
+LDFLAGS = -lrt -lpthread -lm
 
 HFILES = 
 CFILES = capture.c

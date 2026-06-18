@@ -19,6 +19,7 @@
 #include <string.h>
 #include <assert.h>
 #include <stdint.h>
+#include <math.h>
 
 #include <getopt.h>             /* getopt_long() */
 
@@ -111,6 +112,7 @@ long_options[] = {
         { "format", no_argument,       NULL, 'f' },
         { "count",  required_argument, NULL, 'c' },
         { "rate",   required_argument, NULL, 'z' },
+        { "process",no_argument,       NULL, 'p' },
         { 0, 0, 0, 0 }
 };
 
@@ -188,7 +190,7 @@ struct write_thread_arg {
 // Globals
 /******************************************************************************/
 
-static const char short_options[] = "d:hmruofc:z:";
+static const char short_options[] = "d:hmruofc:z:p";
 
 // Format is used by a number of functions, so made as a file global
 static struct v4l2_format fmt;
@@ -205,6 +207,7 @@ static int              frame_count = 180;
 static int rate = 1;
 static int READ_FREQ = 20;
 static int NUM_BIT_BUCKETS;
+static int modify = 0;
 
 struct timespec start_time;
 uint32_t frame_buf_length;
@@ -224,7 +227,8 @@ static void init_device(void);
 static void init_mmap(void);
 static void start_capturing(void);
 static void run_threads(void);
-static void init_ring_buffer(struct ring_buf *input_frame_bufs, struct ring_buf *selected_frame_bufs);
+static void init_ring_buffer(struct ring_buf *input_frame_bufs, struct ring_buf *selected_frame_bufs,
+        struct ring_buf *modified_frame_bufs);
 static void free_ring_buffers(struct ring_buf *input_ring_buf, struct ring_buf *selected_frame_bufs);
 static void timer_handler(union sigval arg);
 static void *sequencer(void *arg);
@@ -233,7 +237,8 @@ static int read_frame(struct ring_buf *input_frame_bufs, struct timespec capture
 void *select_frame_thread(void *arg);
 static void select_frame(struct ring_buf *input_frame_bufs, struct ring_buf *selected_frame_bufs, int *select_count);
 void *modify_frame_thread(void *arg);
-static void modify_frame(struct ring_buf *selected_frame_bufs, struct ring_buf *modified_frame_bufs);
+static void modify_frame(struct ring_buf *selected_frame_bufs, struct ring_buf *modified_frame_bufs,
+        int *modify_count);
 void *write_frame_thread(void *arg);
 void write_frame(struct frame_buf *selected_frame, int32_t write_count);
 static void stop_capturing(void);
@@ -330,6 +335,11 @@ int main(int argc, char **argv)
                     fprintf(stderr, "'--rate'/'-z' must be '1' or '10'\n");
                     exit(EXIT_FAILURE);
                 }
+                break;
+
+            case 'p':
+                modify = 1;
+                printf("Image processing on\n");
                 break;
 
             default:
@@ -599,7 +609,7 @@ static void run_threads(void)
     struct modify_thread_arg modify_targ;
     struct write_thread_arg write_targ;
     pthread_t seq_thread_id, read_thread_id, select_thread_id, modify_thread_id, write_thread_id;
-    uint8_t read_finished = 0, select_finished = 0, modify_finished = 0; write_finished = 0;
+    uint8_t read_finished = 0, select_finished = 0, modify_finished = 0, write_finished = 0;
 
     // Initialize the ring buffer
     init_ring_buffer(&input_frame_bufs, &selected_frame_bufs, &modified_frame_bufs);
@@ -1215,7 +1225,7 @@ void *select_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_response_time, service_release_time);
-        SYSLOG_DEBUG("Select thread execution time %d = %lf", select_count-1, delta_time_real);
+        SYSLOG_DEBUG("Select thread execution time %d = %lf", select_release-1, delta_time_real);
     }
 
     *select_finished = 1;
@@ -1354,7 +1364,7 @@ void *modify_frame_thread(void *arg)
         // If modify overtook select, continue to next semaphore release
         if (!*select_finished) {
             window_head = selected_frame_bufs->tail;
-            window_tail = (window_head + rate/MODIFY_FREQ - 1) % selected_frame_bufs->size;
+            window_tail = (window_head + (int)ceil((double)rate/MODIFY_FREQ) - 1) % selected_frame_bufs->size;
             if ((window_head <= selected_frame_bufs->head)
                     && (window_tail >= selected_frame_bufs->head)) {
                 SYSLOG_DEBUG("Modify window overtook select: ph = %d, pt = %d, r = %d\n",
@@ -1383,7 +1393,7 @@ void *modify_frame_thread(void *arg)
         modify_release++;
 
         // Modify next selected frame and copy to modified_frame_bufs
-        modify_frame(selected_frame_bufs, modified_frame_bufs);
+        modify_frame(selected_frame_bufs, modified_frame_bufs, &modify_count);
 
         // Increment modify count
         if (modify_count >= modify_frames)
@@ -1396,14 +1406,44 @@ void *modify_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_response_time, service_release_time);
-        SYSLOG_DEBUG("Modify thread execution time %d = %lf", select_count-1, delta_time_real);
+        SYSLOG_DEBUG("Modify thread execution time %d = %lf", modify_release-1, delta_time_real);
     }
 
     *modify_finished = 1;
 }
 
-static void modify_frame(struct ring_buf *selected_frame_bufs, struct ring_buf *modified_frame_bufs)
+static void modify_frame(struct ring_buf *selected_frame_bufs, struct ring_buf *modified_frame_bufs,
+        int *modify_count)
 {
+    int frame_count, selected_frame_idx, modified_frame_idx;
+    int val_idx, val;
+
+    // Modify and copy each frame in window
+    for (frame_count = 0; frame_count < (int)ceil((double)rate/MODIFY_FREQ); frame_count++) {
+        selected_frame_idx = (selected_frame_bufs->tail + frame_count) % selected_frame_bufs->size;
+        modified_frame_idx = (modified_frame_bufs->head + frame_count) % modified_frame_bufs->size;
+        // Copy every frame value
+        for (val_idx = 0; val_idx < selected_frame_bufs->start[selected_frame_idx].bytesused; val_idx++) {
+            val = selected_frame_bufs->start[selected_frame_idx].start[val_idx];
+            // Invert luma (Y value)
+            if (val_idx % 2 == 0) {
+                val = 255 - val;
+            }
+            modified_frame_bufs->start[modified_frame_idx].start[val_idx] = val;
+        }
+
+        modify_count++;
+    }
+
+    // Update frame pointers
+    selected_frame_bufs->tail += (int)ceil((double)rate/MODIFY_FREQ);
+    if (selected_frame_bufs->tail >= selected_frame_bufs->size) {
+        selected_frame_bufs->tail %= selected_frame_bufs->size;
+    }
+    modified_frame_bufs->head += (int)ceil((double)rate/MODIFY_FREQ);
+    if (modified_frame_bufs->head >= modified_frame_bufs->size) {
+        modified_frame_bufs->head %= modified_frame_bufs->size;
+    }
 }
 
 void *write_frame_thread(void *arg)
@@ -1432,7 +1472,7 @@ void *write_frame_thread(void *arg)
         // If write overtook prev, continue to next semaphore release 
         if (!*prev_finished) {
             window_head = prev_frame_bufs->tail;
-            window_tail = (window_head + rate/WRITE_FREQ - 1) % prev_frame_bufs->size;
+            window_tail = (window_head + (int)ceil((double)rate/WRITE_FREQ) - 1) % prev_frame_bufs->size;
             if ((window_head <= prev_frame_bufs->head)
                     && (window_tail >= prev_frame_bufs->head)) {
                 SYSLOG_DEBUG("Write window overtook prev: ph = %d, pt = %d, r = %d\n",
@@ -1463,14 +1503,14 @@ void *write_frame_thread(void *arg)
         if (write_count < 0) {
             SYSLOG_DEBUG("Bit-bucket frame %d\n", write_count);
 
-            prev_frame_bufs->tail += rate/WRITE_FREQ;
-            write_count += rate/WRITE_FREQ;
+            prev_frame_bufs->tail += (int)ceil((double)rate/WRITE_FREQ);
+            write_count += (int)ceil((double)rate/WRITE_FREQ);
 
             continue;
         }
 
         // Write rate number of images to memory
-        for (int i = 0; i < rate/WRITE_FREQ; i++) {
+        for (int i = 0; i < (int)ceil((double)rate/WRITE_FREQ); i++) {
             SYSLOG_DEBUG("Writing from prev index %d\n", prev_frame_bufs->tail);
             write_frame(&prev_frame_bufs->start[prev_frame_bufs->tail], write_count);
 
