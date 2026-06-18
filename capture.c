@@ -1432,7 +1432,13 @@ static void modify_frame(struct ring_buf *selected_frame_bufs, struct ring_buf *
             modified_frame_bufs->start[modified_frame_idx].start[val_idx] = val;
         }
 
-        modify_count++;
+        // Update frame data
+        modified_frame_bufs->start[modified_frame_idx].bytesused =
+            selected_frame_bufs->start[selected_frame_idx].bytesused;
+        modified_frame_bufs->start[modified_frame_idx].timestamp =
+            selected_frame_bufs->start[selected_frame_idx].timestamp;
+
+        (*modify_count)++;
     }
 
     // Update frame pointers
