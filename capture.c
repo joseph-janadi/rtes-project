@@ -82,10 +82,12 @@
 #define TEST_CPU 3
 #define READ_CPU SERVICE_CPU
 #define SELECT_CPU SERVICE_CPU
+#define MODIFY_CPU SERVICE_CPU
 #define WRITE_CPU SERVICE_CPU
 #define SEQ_FREQ 120
 //#define READ_FREQ 20
 #define SELECT_FREQ 5
+#define MODIFY_FREQ 2
 #define WRITE_FREQ 1
 #define NSEC_PER_SEC 1000000000L
 #define NSEC_PER_USEC 1000L
@@ -148,28 +150,37 @@ struct seq_thread_arg {
     sem_t *seq_sem;
     sem_t *read_sem;
     sem_t *select_sem;
+    sem_t *modify_sem;
     sem_t *write_sem;
     uint8_t *read_finished;
     uint8_t *select_finished;
+    uint8_t *modify_finished;
     uint8_t *write_finished;
 };
 struct read_thread_arg {
     sem_t *sem;
-    struct ring_buf *raw_frame_bufs;
+    struct ring_buf *input_frame_bufs;
     uint8_t *read_finished;
     uint8_t *select_finished;
 };
 struct select_thread_arg {
     sem_t *sem;
-    struct ring_buf *raw_frame_bufs;
+    struct ring_buf *input_frame_bufs;
     struct ring_buf *selected_frame_bufs;
     uint8_t *read_finished;
     uint8_t *select_finished;
 };
-struct write_thread_arg {
+struct modify_thread_arg {
     sem_t *sem;
     struct ring_buf *selected_frame_bufs;
+    struct ring_buf *modified_frame_bufs;
     uint8_t *select_finished;
+    uint8_t *modify_finished;
+};
+struct write_thread_arg {
+    sem_t *sem;
+    struct ring_buf *prev_frame_bufs;
+    uint8_t *prev_finished;
     uint8_t *write_finished;
 };
 
@@ -213,14 +224,16 @@ static void init_device(void);
 static void init_mmap(void);
 static void start_capturing(void);
 static void run_threads(void);
-static void init_ring_buffer(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs);
-static void free_ring_buffers(struct ring_buf *raw_ring_buf, struct ring_buf *selected_frame_bufs);
+static void init_ring_buffer(struct ring_buf *input_frame_bufs, struct ring_buf *selected_frame_bufs);
+static void free_ring_buffers(struct ring_buf *input_ring_buf, struct ring_buf *selected_frame_bufs);
 static void timer_handler(union sigval arg);
 static void *sequencer(void *arg);
 void *read_frame_thread(void *arg);
-static int read_frame(struct ring_buf *raw_frame_bufs, struct timespec capture_time);
+static int read_frame(struct ring_buf *input_frame_bufs, struct timespec capture_time);
 void *select_frame_thread(void *arg);
-static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs, int *select_count);
+static void select_frame(struct ring_buf *input_frame_bufs, struct ring_buf *selected_frame_bufs, int *select_count);
+void *modify_frame_thread(void *arg);
+static void modify_frame(struct ring_buf *selected_frame_bufs, struct ring_buf *modified_frame_bufs);
 void *write_frame_thread(void *arg);
 void write_frame(struct frame_buf *selected_frame, int32_t write_count);
 static void stop_capturing(void);
@@ -574,26 +587,28 @@ static void start_capturing(void)
 static void run_threads(void)
 {
     int r;
-    struct ring_buf raw_frame_bufs, selected_frame_bufs;
+    struct ring_buf input_frame_bufs, selected_frame_bufs, modified_frame_bufs;
     cpu_set_t cpu_set;
     int max_prio;
     struct sched_param s_param;
-    sem_t seq_sem, read_sem, select_sem, write_sem;
+    sem_t seq_sem, read_sem, select_sem, modify_sem, write_sem;
     pthread_attr_t thread_attr;
     struct seq_thread_arg seq_targ;
     struct read_thread_arg read_targ;
     struct select_thread_arg select_targ;
+    struct modify_thread_arg modify_targ;
     struct write_thread_arg write_targ;
-    pthread_t seq_thread_id, read_thread_id, select_thread_id, write_thread_id;
-    uint8_t read_finished = 0, select_finished = 0, write_finished = 0;
+    pthread_t seq_thread_id, read_thread_id, select_thread_id, modify_thread_id, write_thread_id;
+    uint8_t read_finished = 0, select_finished = 0, modify_finished = 0; write_finished = 0;
 
     // Initialize the ring buffer
-    init_ring_buffer(&raw_frame_bufs, &selected_frame_bufs);
+    init_ring_buffer(&input_frame_bufs, &selected_frame_bufs, &modified_frame_bufs);
 
     // Initialize the semaphores
     r = sem_init(&seq_sem, 0, 0);
     r |= sem_init(&read_sem, 0, 0);
     r |= sem_init(&select_sem, 0, 0);
+    r |= sem_init(&modify_sem, 0, 0);
     r |= sem_init(&write_sem, 0, 0);
     if (r) {
         fprintf(stderr, "Error run_threads: Failed to initialize semaphores: %d, %s\n",
@@ -625,9 +640,11 @@ static void run_threads(void)
     seq_targ.seq_sem = &seq_sem;
     seq_targ.read_sem = &read_sem;
     seq_targ.select_sem = &select_sem;
+    seq_targ.modify_sem = &modify_sem;
     seq_targ.write_sem = &write_sem;
     seq_targ.read_finished = &read_finished;
     seq_targ.select_finished = &select_finished;
+    seq_targ.modify_finished = &modify_finished;
     seq_targ.write_finished = &write_finished;
     pthread_create(&seq_thread_id, &thread_attr, sequencer, &seq_targ);
 
@@ -642,7 +659,7 @@ static void run_threads(void)
         exit(EXIT_FAILURE);
     }
     read_targ.sem = &read_sem;
-    read_targ.raw_frame_bufs = &raw_frame_bufs;
+    read_targ.input_frame_bufs = &input_frame_bufs;
     read_targ.read_finished = &read_finished;
     read_targ.select_finished = &select_finished;
     pthread_create(&read_thread_id, &thread_attr, read_frame_thread, &read_targ);
@@ -658,31 +675,55 @@ static void run_threads(void)
         exit(EXIT_FAILURE);
     }
     select_targ.sem = &select_sem;
-    select_targ.raw_frame_bufs = &raw_frame_bufs;
+    select_targ.input_frame_bufs = &input_frame_bufs;
     select_targ.selected_frame_bufs = &selected_frame_bufs;
     select_targ.read_finished = &read_finished;
     select_targ.select_finished = &select_finished;
     pthread_create(&select_thread_id, &thread_attr, select_frame_thread, &select_targ);
 
+    // Create the modify thread
+    CPU_ZERO(&cpu_set);
+    CPU_SET(MODIFY_CPU, &cpu_set);
+    r = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set), &cpu_set);
+    s_param.sched_priority = max_prio - 2;
+    r |= pthread_attr_setschedparam(&thread_attr, &s_param);
+    if (r) {
+        fprintf(stderr, "Error run_threads: Failed to configure modify thread attributes\n");
+        exit(EXIT_FAILURE);
+    }
+    modify_targ.sem = &modify_sem;
+    modify_targ.selected_frame_bufs = &selected_frame_bufs;
+    modify_targ.modified_frame_bufs = &modified_frame_bufs;
+    modify_targ.select_finished = &select_finished;
+    modify_targ.modify_finished = &modify_finished;
+    pthread_create(&modify_thread_id, &thread_attr, modify_frame_thread, &modify_targ);
+
     // Create the write thread
     CPU_ZERO(&cpu_set);
     CPU_SET(WRITE_CPU, &cpu_set);
     r = pthread_attr_setaffinity_np(&thread_attr, sizeof(cpu_set), &cpu_set);
-    s_param.sched_priority = max_prio - 2;
+    s_param.sched_priority = max_prio - 3;
     r |= pthread_attr_setschedparam(&thread_attr, &s_param);
     if (r) {
         fprintf(stderr, "Error run_threads: Failed to configure write thread attributes\n");
         exit(EXIT_FAILURE);
     }
     write_targ.sem = &write_sem;
-    write_targ.selected_frame_bufs = &selected_frame_bufs;
-    write_targ.select_finished = &select_finished;
+    if (modify) {
+        write_targ.prev_frame_bufs = &modified_frame_bufs;
+        write_targ.prev_finished = &modify_finished;
+    }
+    else {
+        write_targ.prev_frame_bufs = &selected_frame_bufs;
+        write_targ.prev_finished = &select_finished;
+    }
     write_targ.write_finished = &write_finished;
     pthread_create(&write_thread_id, &thread_attr, write_frame_thread, &write_targ);
 
     /* Wait for the threads to terminate */
     r = pthread_join(read_thread_id, NULL);
     r |= pthread_join(select_thread_id, NULL);
+    r |= pthread_join(modify_thread_id, NULL);
     r |= pthread_join(write_thread_id, NULL);
     r |= pthread_join(seq_thread_id, NULL);
     if (r) {
@@ -694,6 +735,7 @@ static void run_threads(void)
     r = sem_destroy(&seq_sem);
     r |= sem_destroy(&read_sem);
     r |= sem_destroy(&select_sem);
+    r |= sem_destroy(&modify_sem);
     r |= sem_destroy(&write_sem);
     if (r) {
         fprintf(stderr, "Error run_threads: Failed to destroy semaphores: %d, %s\n",
@@ -702,49 +744,52 @@ static void run_threads(void)
     }
 
     // TODO: Free ring buffers memory
-    //free_ring_buffers(&raw_ring_buf, &selected_frame_bufs);
+    //free_ring_buffers(&input_ring_buf, &selected_frame_bufs);
 }
 
 /* Allocates memory for the ring buffer */
-static void init_ring_buffer(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs)
+static void init_ring_buffer(struct ring_buf *input_frame_bufs, struct ring_buf *selected_frame_bufs,
+        struct ring_buf *modified_frame_bufs)
 {
-    size_t raw_ring_buf_size;
+    size_t input_ring_buf_size;
     size_t selected_ring_buf_size;
+    size_t modified_ring_buf_size;
 
     // Allocate multiple window lengths to prevent overwrite
-    raw_ring_buf_size = frame_count + 1 + NUM_BIT_BUCKETS;
-    printf("raw_frame_bufs->size = %lu\n", raw_ring_buf_size);
-
-    // Allocate enough buffers to prevent overwrite
+    input_ring_buf_size = frame_count + 1 + NUM_BIT_BUCKETS;
     selected_ring_buf_size = frame_count + 1 + NUM_BIT_BUCKETS;
-    printf("selected_frame_bufs->size = %lu\n", selected_ring_buf_size);
+    modified_ring_buf_size = frame_count + 1 + NUM_BIT_BUCKETS;
 
     // Allocate ring buffer
-    raw_frame_bufs->start = (struct frame_buf *)malloc(raw_ring_buf_size * sizeof(struct frame_buf));
-    if (raw_frame_bufs->start == NULL) {
-        fprintf(stderr, "Error init_ring_buffers: Failed to allocate raw ring buffer\n");
+    input_frame_bufs->start = (struct frame_buf *)malloc(input_ring_buf_size * sizeof(struct frame_buf));
+    if (input_frame_bufs->start == NULL) {
+        fprintf(stderr, "Error init_ring_buffers: Failed to allocate input ring buffer\n");
         exit(EXIT_FAILURE);
     }
     selected_frame_bufs->start = (struct frame_buf *)malloc(selected_ring_buf_size * sizeof(struct frame_buf));
     if (selected_frame_bufs->start == NULL) {
-        fprintf(stderr, "Error init_ring_buffers: Failed to allocate write ring buffer\n");
+        fprintf(stderr, "Error init_ring_buffers: Failed to allocate selected ring buffer\n");
+        exit(EXIT_FAILURE);
+    }
+    modified_frame_bufs->start = (struct frame_buf *)malloc(modified_ring_buf_size * sizeof(struct frame_buf));
+    if (modified_frame_bufs->start == NULL) {
+        fprintf(stderr, "Error init_ring_buffers: Failed to allocate modified ring buffer\n");
         exit(EXIT_FAILURE);
     }
 
     // Allocate image buffers within ring buffers
-    for (int i = 0; i < raw_ring_buf_size; i++) {
-        raw_frame_bufs->start[i].start = (unsigned char *)malloc(frame_buf_length * sizeof(unsigned char));
+    for (int i = 0; i < input_ring_buf_size; i++) {
+        input_frame_bufs->start[i].start = (unsigned char *)malloc(frame_buf_length * sizeof(unsigned char));
 
-        if (raw_frame_bufs->start[i].start == NULL) {
+        if (input_frame_bufs->start[i].start == NULL) {
             fprintf(stderr, "Error init_ring_buffer: Failed to allocate image buffer within ring buffer\n");
             for (int j = 0; j < i; j++) {
-                free(raw_frame_bufs->start[j].start);
+                free(input_frame_bufs->start[j].start);
             }
-            free(raw_frame_bufs->start);
+            free(input_frame_bufs->start);
             exit(EXIT_FAILURE);
         }
     }
-
     for (int i = 0; i < selected_ring_buf_size; i++) {
         selected_frame_bufs->start[i].start = (unsigned char *)malloc(frame_buf_length * sizeof(unsigned char));
 
@@ -757,22 +802,43 @@ static void init_ring_buffer(struct ring_buf *raw_frame_bufs, struct ring_buf *s
             exit(EXIT_FAILURE);
         }
     }
+    for (int i = 0; i < modified_ring_buf_size; i++) {
+        modified_frame_bufs->start[i].start = (unsigned char *)malloc(frame_buf_length * sizeof(unsigned char));
 
-    raw_frame_bufs->size = raw_ring_buf_size;
-    raw_frame_bufs->head = 0;
-    raw_frame_bufs->tail = 0;
-    raw_frame_bufs->head_wraps = 0;
-    raw_frame_bufs->tail_wraps = 0;
+        if (modified_frame_bufs->start[i].start == NULL) {
+            fprintf(stderr, "Error init_ring_buffer: Failed to allocate image buffer within ring buffer\n");
+            for (int j = 0; j < i; j++) {
+                free(modified_frame_bufs->start[j].start);
+            }
+            free(modified_frame_bufs->start);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    input_frame_bufs->size = input_ring_buf_size;
+    printf("input_frame_bufs->size = %lu\n", input_ring_buf_size);
+    input_frame_bufs->head = 0;
+    input_frame_bufs->tail = 0;
+    input_frame_bufs->head_wraps = 0;
+    input_frame_bufs->tail_wraps = 0;
 
     selected_frame_bufs->size = selected_ring_buf_size;
+    printf("selected_frame_bufs->size = %lu\n", selected_ring_buf_size);
     selected_frame_bufs->head = 0;
     selected_frame_bufs->tail = 0;
     selected_frame_bufs->head_wraps = 0;
     selected_frame_bufs->tail_wraps = 0;
+
+    modified_frame_bufs->size = modified_ring_buf_size;
+    printf("modified_frame_bufs->size = %lu\n", modified_ring_buf_size);
+    modified_frame_bufs->head = 0;
+    modified_frame_bufs->tail = 0;
+    modified_frame_bufs->head_wraps = 0;
+    modified_frame_bufs->tail_wraps = 0;
 }
 
 /* TODO: Frees ring buffer memory */
-static void free_ring_buffers(struct ring_buf *raw_ring_buf, struct ring_buf *selected_frame_bufs)
+static void free_ring_buffers(struct ring_buf *input_ring_buf, struct ring_buf *selected_frame_bufs)
 {
 }
 
@@ -794,9 +860,11 @@ static void *sequencer(void *arg)
     int r;
     struct seq_thread_arg *targ = (struct seq_thread_arg *)arg;
     sem_t *seq_sem = targ->seq_sem, *read_sem = targ->read_sem,
-          *select_sem = targ->select_sem, *write_sem = targ->write_sem;
+          *select_sem = targ->select_sem, *modify_sem = targ->modify_sem,
+          *write_sem = targ->write_sem;
     uint8_t *read_finished = targ->read_finished,
             *select_finished = targ->select_finished,
+            *modify_finished = targ->modify_finished,
             *write_finished = targ->write_finished;
     pthread_attr_t timer_handler_attr;
     cpu_set_t cpu_set;
@@ -809,6 +877,7 @@ static void *sequencer(void *arg)
     uint32_t seq_count = 0;
     const uint8_t READ_RELEASE_FREQ = SEQ_FREQ/READ_FREQ,
           SELECT_RELEASE_FREQ = SEQ_FREQ/SELECT_FREQ,
+          MODIFY_RELEASE_FREQ = SEQ_FREQ/MODIFY_FREQ,
           WRITE_RELEASE_FREQ = SEQ_FREQ/WRITE_FREQ;
 
     // Initialize timer handler pthread attributes
@@ -855,7 +924,7 @@ static void *sequencer(void *arg)
     }
 
     // Sequencer loop
-    while (!(*read_finished & *select_finished & *write_finished)) {
+    while (!(*read_finished & *select_finished & *modify_finished & *write_finished)) {
         seq_count++;
 
         // Wait for release by timer_handler
@@ -886,6 +955,16 @@ static void *sequencer(void *arg)
             }
         }
 
+        // Release modify semaphore
+        if ((!*modify_finished) && (seq_count % MODIFY_RELEASE_FREQ == 0)) {
+            r = sem_post(modify_sem);
+            if (r) {
+                fprintf(stderr, "Error sequencer: Failed to post modify semaphore: %d, %s\n",
+                        errno, strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+        }
+
         // Release write semaphore
         if ((!*write_finished) && (seq_count % WRITE_RELEASE_FREQ == 0)) {
             r = sem_post(write_sem);
@@ -911,7 +990,7 @@ void *read_frame_thread(void *arg)
     double delta_time_real;
     struct read_thread_arg *targ = (struct read_thread_arg *)arg;
     sem_t *read_sem = targ->sem;
-    struct ring_buf *raw_frame_bufs = targ->raw_frame_bufs;
+    struct ring_buf *input_frame_bufs = targ->input_frame_bufs;
     uint8_t *read_finished = targ->read_finished;
     uint8_t *select_finished = targ->select_finished;
     //int read_frames = READ_FREQ/rate * (frame_count + 1 + NUM_BIT_BUCKETS);
@@ -970,7 +1049,7 @@ void *read_frame_thread(void *arg)
                 exit(EXIT_FAILURE);
             }
 
-            if (read_frame(raw_frame_bufs, service_release_time))
+            if (read_frame(input_frame_bufs, service_release_time))
             {
                 if(nanosleep(&read_delay, &time_error) != 0)
                     perror("nanosleep");
@@ -997,7 +1076,7 @@ void *read_frame_thread(void *arg)
     *read_finished = 1;
 }
 
-static int read_frame(struct ring_buf *raw_frame_bufs, struct timespec capture_time)
+static int read_frame(struct ring_buf *input_frame_bufs, struct timespec capture_time)
 {
     int r;
     struct v4l2_buffer buf;
@@ -1031,32 +1110,32 @@ static int read_frame(struct ring_buf *raw_frame_bufs, struct timespec capture_t
     assert(buf.index < n_buffers);
 
     // Check for buffer overflow
-    if ((raw_frame_bufs->head == raw_frame_bufs->tail) &&
-            (raw_frame_bufs->head_wraps > raw_frame_bufs->tail_wraps)) {
-        fprintf(stderr, "Error read_frame: Raw frame buffer overwrite\n");
+    if ((input_frame_bufs->head == input_frame_bufs->tail) &&
+            (input_frame_bufs->head_wraps > input_frame_bufs->tail_wraps)) {
+        fprintf(stderr, "Error read_frame: input frame buffer overwrite\n");
         exit(EXIT_FAILURE);
     }
 
-    // Copy frame from video buffer to raw_frame_bufs
-    SYSLOG_DEBUG("Read from camera index %d to raw index %d\n",
-            buf.index, raw_frame_bufs->head);
-    memcpy(raw_frame_bufs->start[raw_frame_bufs->head].start,
+    // Copy frame from video buffer to input_frame_bufs
+    SYSLOG_DEBUG("Read from camera index %d to input index %d\n",
+            buf.index, input_frame_bufs->head);
+    memcpy(input_frame_bufs->start[input_frame_bufs->head].start,
             buffers[buf.index].start, buf.bytesused);
 
     // Update frame buffer parameters
-    raw_frame_bufs->start[raw_frame_bufs->head].bytesused = buf.bytesused;
-    raw_frame_bufs->start[raw_frame_bufs->head].timestamp = capture_time;
+    input_frame_bufs->start[input_frame_bufs->head].bytesused = buf.bytesused;
+    input_frame_bufs->start[input_frame_bufs->head].timestamp = capture_time;
 
     // Enqueue frame buffer
     if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
         errno_exit("VIDIOC_QBUF select_frame");
 
     // Increment head position
-    raw_frame_bufs->head++;
+    input_frame_bufs->head++;
     // Check for wrap
-    if (raw_frame_bufs->head >= raw_frame_bufs->size) {
-        raw_frame_bufs->head = 0;
-        raw_frame_bufs->head_wraps++;
+    if (input_frame_bufs->head >= input_frame_bufs->size) {
+        input_frame_bufs->head = 0;
+        input_frame_bufs->head_wraps++;
     }
 
     //printf("R");
@@ -1069,7 +1148,7 @@ void *select_frame_thread(void *arg)
     double delta_time_real;
     struct select_thread_arg *targ = (struct select_thread_arg *)arg;
     sem_t *select_sem = targ->sem;
-    struct ring_buf *raw_frame_bufs = targ->raw_frame_bufs;
+    struct ring_buf *input_frame_bufs = targ->input_frame_bufs;
     struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
     uint8_t *read_finished = targ->read_finished,
             *select_finished = targ->select_finished;
@@ -1091,21 +1170,21 @@ void *select_frame_thread(void *arg)
 
         // If select overtook read, continue to next semaphore release
         if (!*read_finished) {
-            window_head = raw_frame_bufs->tail;
+            window_head = input_frame_bufs->tail;
             window_tail = (window_head + READ_FREQ/SELECT_FREQ) %
-                raw_frame_bufs->size;
-            if ((window_head <= raw_frame_bufs->head)
-                    && (window_tail >= raw_frame_bufs->head)) {
+                input_frame_bufs->size;
+            if ((window_head <= input_frame_bufs->head)
+                    && (window_tail >= input_frame_bufs->head)) {
                 SYSLOG_DEBUG("Select window overtook read: ph = %d, pt = %d, r = %d\n",
-                        window_head, window_tail, raw_frame_bufs->head);
+                        window_head, window_tail, input_frame_bufs->head);
                 continue;
             }
             // Select window wrapped around ring buffer
             if (window_tail < window_head) {
-                if ((window_head <= raw_frame_bufs->head)
-                        || (window_tail >= raw_frame_bufs->head)) {
+                if ((window_head <= input_frame_bufs->head)
+                        || (window_tail >= input_frame_bufs->head)) {
                     SYSLOG_DEBUG("Select window overtook read: ph = %d, pt = %d, r = %d\n",
-                            window_head, window_tail, raw_frame_bufs->head);
+                            window_head, window_tail, input_frame_bufs->head);
                     continue;
                 }
             }
@@ -1121,9 +1200,9 @@ void *select_frame_thread(void *arg)
         SYSLOG_INFO("S2 %d @ %lf", select_release, delta_time_real);
         select_release++;
 
-        // Find best frame in raw_frame_bufs window and copy to
+        // Find best frame in input_frame_bufs window and copy to
         // selected_frame_bufs
-        select_frame(raw_frame_bufs, selected_frame_bufs, &select_count);
+        select_frame(input_frame_bufs, selected_frame_bufs, &select_count);
 
         // Increment select count
         if (select_count >= select_frames)
@@ -1142,7 +1221,7 @@ void *select_frame_thread(void *arg)
     *select_finished = 1;
 }
 
-static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selected_frame_bufs, int *select_count)
+static void select_frame(struct ring_buf *input_frame_bufs, struct ring_buf *selected_frame_bufs, int *select_count)
 {
     struct v4l2_buffer buf;
     static ssize_t next_frame_idx = -1;
@@ -1160,8 +1239,8 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
     // Detect tick: Get percent diff between each consecutive pair of frames in window,
     // including first frame from next window
     for (i = 0; i < READ_FREQ/SELECT_FREQ; i++) {
-        size_t frame1_idx = (raw_frame_bufs->tail + i) % raw_frame_bufs->size,
-               frame2_idx = (frame1_idx + 1) % raw_frame_bufs->size;
+        size_t frame1_idx = (input_frame_bufs->tail + i) % input_frame_bufs->size,
+               frame2_idx = (frame1_idx + 1) % input_frame_bufs->size;
         double average_diff, percent_diff;
         size_t num_bytes = HRES * VRES * 2;
         size_t num_ys =  num_bytes / 2;    // Assuming YUYV format
@@ -1180,10 +1259,10 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
             }
 
             // Copy frame
-            SYSLOG_DEBUG("Selecting from raw index %d to selected index %d\n",
+            SYSLOG_DEBUG("Selecting from input index %d to selected index %d\n",
                     next_frame_idx, selected_frame_bufs->head);
             memcpy(&selected_frame_bufs->start[selected_frame_bufs->head],
-                    &raw_frame_bufs->start[next_frame_idx], sizeof(struct frame_buf));
+                    &input_frame_bufs->start[next_frame_idx], sizeof(struct frame_buf));
             selected_frame_bufs->head++;
             if (selected_frame_bufs->head >= selected_frame_bufs->size) {
                 selected_frame_bufs->head %= selected_frame_bufs->size;
@@ -1203,8 +1282,8 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
 
         // Find percent diff between bytes
         for (byte_idx = 0; byte_idx < num_bytes; byte_idx++) {
-            frame1_val = raw_frame_bufs->start[frame1_idx].start[byte_idx];
-            frame2_val = raw_frame_bufs->start[frame2_idx].start[byte_idx];
+            frame1_val = input_frame_bufs->start[frame1_idx].start[byte_idx];
+            frame2_val = input_frame_bufs->start[frame2_idx].start[byte_idx];
             if (frame1_val < frame2_val)
                 sum += (frame2_val - frame1_val);
             else
@@ -1217,9 +1296,9 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
 
         // If tick detected, set next best frame
         if (percent_diff >= percent_diff_threshold) {
-            next_frame_idx = (frame1_idx + ((READ_FREQ / rate + 1) / 2)) % raw_frame_bufs->size;
+            next_frame_idx = (frame1_idx + ((READ_FREQ / rate + 1) / 2)) % input_frame_bufs->size;
             SYSLOG_DEBUG("Window = %d..%d; Tick Index = %d; Selected Index = %d\n",
-                    raw_frame_bufs->tail, (raw_frame_bufs->tail + READ_FREQ/SELECT_FREQ - 1) % raw_frame_bufs->size,
+                    input_frame_bufs->tail, (input_frame_bufs->tail + READ_FREQ/SELECT_FREQ - 1) % input_frame_bufs->size,
                     frame1_idx, next_frame_idx);
         }
         // If tick not detected, increment num_frames_skipped
@@ -1227,18 +1306,104 @@ static void select_frame(struct ring_buf *raw_frame_bufs, struct ring_buf *selec
             num_frames_skipped++;
             // If too many frames skipped, set next_frame_idx based on last_frame_idx
             if (num_frames_skipped == (READ_FREQ / rate)) {
-                next_frame_idx = (last_frame_idx + (READ_FREQ / rate)) % raw_frame_bufs->size;
+                next_frame_idx = (last_frame_idx + (READ_FREQ / rate)) % input_frame_bufs->size;
                 SYSLOG_DEBUG("No Tick Detected; Selected Index = %d\n", next_frame_idx);
             }
         }
     }
 
-    // Update raw_frame_bufs tail
-    raw_frame_bufs->tail += READ_FREQ/SELECT_FREQ;
-    if (raw_frame_bufs->tail >= raw_frame_bufs->size) {
-        raw_frame_bufs->tail %= raw_frame_bufs->size;
-        raw_frame_bufs->tail_wraps++;
+    // Update input_frame_bufs tail
+    input_frame_bufs->tail += READ_FREQ/SELECT_FREQ;
+    if (input_frame_bufs->tail >= input_frame_bufs->size) {
+        input_frame_bufs->tail %= input_frame_bufs->size;
+        input_frame_bufs->tail_wraps++;
     }
+}
+
+void *modify_frame_thread(void *arg)
+{
+    int r;
+    double delta_time_real;
+    struct modify_thread_arg *targ = (struct modify_thread_arg *)arg;
+    sem_t *modify_sem = targ->sem;
+    struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
+    struct ring_buf *modified_frame_bufs = targ->modified_frame_bufs;
+    uint8_t *select_finished = targ->select_finished,
+            *modify_finished = targ->modify_finished;
+    int modify_frames = frame_count + 1;
+    int32_t modify_count = -NUM_BIT_BUCKETS;
+    int modify_release = 0;
+    struct timespec service_release_time, service_response_time;
+    size_t window_head, window_tail;
+
+    // Exit thread if modify flag not set
+    if (!modify) {
+        *modify_finished = 1;
+        pthread_exit(NULL);
+    }
+
+    // Modify flag set: Enter service loop
+    while (1) {
+        /* Wait for modify semaphore */
+        if (sem_wait(modify_sem) == -1) {
+            fprintf(stderr, "Error modify_frame_thread: Failed to wait for modify_sem: %d, %s\n",
+                    errno, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+
+        // If modify overtook select, continue to next semaphore release
+        if (!*select_finished) {
+            window_head = selected_frame_bufs->tail;
+            window_tail = (window_head + rate/MODIFY_FREQ - 1) % selected_frame_bufs->size;
+            if ((window_head <= selected_frame_bufs->head)
+                    && (window_tail >= selected_frame_bufs->head)) {
+                SYSLOG_DEBUG("Modify window overtook select: ph = %d, pt = %d, r = %d\n",
+                        window_head, window_tail, selected_frame_bufs->head);
+                continue;
+            }
+            // Modify window wrapped around ring buffer
+            if (window_tail < window_head) {
+                if ((window_head <= selected_frame_bufs->head)
+                        || (window_tail >= selected_frame_bufs->head)) {
+                    SYSLOG_DEBUG("Modify window overtook select: ph = %d, pt = %d, r = %d\n",
+                            window_head, window_tail, selected_frame_bufs->head);
+                    continue;
+                }
+            }
+        }
+        
+        // Log modify service release time
+        if (clock_gettime(CLOCKID, &service_release_time) == -1) {
+            fprintf(stderr, "Error modify_frame_thread: Failed to get thread start time: %d, %s\n",
+                    errno, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        delta_time_real = get_delta_time_real(service_release_time, start_time);
+        SYSLOG_INFO("S3 %d @ %lf", modify_release, delta_time_real);
+        modify_release++;
+
+        // Modify next selected frame and copy to modified_frame_bufs
+        modify_frame(selected_frame_bufs, modified_frame_bufs);
+
+        // Increment modify count
+        if (modify_count >= modify_frames)
+            break;
+
+        // Log modify service execution time
+        if (clock_gettime(CLOCKID, &service_response_time) == -1) {
+            fprintf(stderr, "Error modify_frame_thread: Failed to get thread end time: %d, %s\n",
+                    errno, strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        delta_time_real = get_delta_time_real(service_response_time, service_release_time);
+        SYSLOG_DEBUG("Modify thread execution time %d = %lf", select_count-1, delta_time_real);
+    }
+
+    *modify_finished = 1;
+}
+
+static void modify_frame(struct ring_buf *selected_frame_bufs, struct ring_buf *modified_frame_bufs)
+{
 }
 
 void *write_frame_thread(void *arg)
@@ -1247,9 +1412,9 @@ void *write_frame_thread(void *arg)
     double delta_time_real;
     struct write_thread_arg *targ = (struct write_thread_arg *)arg;
     sem_t *write_sem = targ->sem;
-    uint8_t *select_finished = targ->select_finished;
+    uint8_t *prev_finished = targ->prev_finished;
     uint8_t *write_finished = targ->write_finished;
-    struct ring_buf *selected_frame_bufs = targ->selected_frame_bufs;
+    struct ring_buf *prev_frame_bufs = targ->prev_frame_bufs;
     int write_frames = frame_count + 1;
     int32_t write_count = -NUM_BIT_BUCKETS;
     int write_release = 0;
@@ -1264,21 +1429,21 @@ void *write_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
 
-        // If write overtook select, continue to next semaphore release 
-        if (!*select_finished) {
-            window_head = selected_frame_bufs->tail;
-            window_tail = (window_head + rate - 1) % selected_frame_bufs->size;
-            if ((window_head <= selected_frame_bufs->head)
-                    && (window_tail >= selected_frame_bufs->head)) {
-                SYSLOG_DEBUG("Write window overtook select: ph = %d, pt = %d, r = %d\n",
-                        window_head, window_tail, selected_frame_bufs->head);
+        // If write overtook prev, continue to next semaphore release 
+        if (!*prev_finished) {
+            window_head = prev_frame_bufs->tail;
+            window_tail = (window_head + rate/WRITE_FREQ - 1) % prev_frame_bufs->size;
+            if ((window_head <= prev_frame_bufs->head)
+                    && (window_tail >= prev_frame_bufs->head)) {
+                SYSLOG_DEBUG("Write window overtook prev: ph = %d, pt = %d, r = %d\n",
+                        window_head, window_tail, prev_frame_bufs->head);
                 continue;
             }
-            // Select window wrapped around ring buffer
+            // prev window wrapped around ring buffer
             if (window_tail < window_head) {
-                if ((window_head <= selected_frame_bufs->head)
-                        || (window_tail >= selected_frame_bufs->head)) {
-                    SYSLOG_DEBUG("Write window wrapped and overtook select\n");
+                if ((window_head <= prev_frame_bufs->head)
+                        || (window_tail >= prev_frame_bufs->head)) {
+                    SYSLOG_DEBUG("Write window wrapped and overtook prev\n");
                     continue;
                 }
             }
@@ -1291,28 +1456,28 @@ void *write_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
-        SYSLOG_INFO("S3 %d @ %lf", write_release, delta_time_real);
+        SYSLOG_INFO("S4 %d @ %lf", write_release, delta_time_real);
         write_release++;
 
         // Bit-bucket first frames
         if (write_count < 0) {
             SYSLOG_DEBUG("Bit-bucket frame %d\n", write_count);
 
-            selected_frame_bufs->tail += rate;
-            write_count += rate;
+            prev_frame_bufs->tail += rate/WRITE_FREQ;
+            write_count += rate/WRITE_FREQ;
 
             continue;
         }
 
         // Write rate number of images to memory
-        for (int i = 0; i < rate; i++) {
-            SYSLOG_DEBUG("Writing from selected index %d\n", selected_frame_bufs->tail);
-            write_frame(&selected_frame_bufs->start[selected_frame_bufs->tail], write_count);
+        for (int i = 0; i < rate/WRITE_FREQ; i++) {
+            SYSLOG_DEBUG("Writing from prev index %d\n", prev_frame_bufs->tail);
+            write_frame(&prev_frame_bufs->start[prev_frame_bufs->tail], write_count);
 
-            selected_frame_bufs->tail++;
-            if (selected_frame_bufs->tail >= selected_frame_bufs->size) {
-                selected_frame_bufs->tail %= selected_frame_bufs->size;
-                selected_frame_bufs->tail_wraps++;
+            prev_frame_bufs->tail++;
+            if (prev_frame_bufs->tail >= prev_frame_bufs->size) {
+                prev_frame_bufs->tail %= prev_frame_bufs->size;
+                prev_frame_bufs->tail_wraps++;
             }
 
             write_count++;
@@ -1336,14 +1501,14 @@ void *write_frame_thread(void *arg)
     *write_finished = 1;
 }
 
-void write_frame(struct frame_buf *selected_frame, int32_t write_count)
+void write_frame(struct frame_buf *prev_frame, int32_t write_count)
 {
     int r;
     int i, newi, newsize=0;
     int y_temp, y2_temp, u_temp, v_temp;
-    unsigned char *pptr = selected_frame->start;
-    int size = selected_frame->bytesused;
-    struct timespec cur_time = selected_frame->timestamp;
+    unsigned char *pptr = prev_frame->start;
+    int size = prev_frame->bytesused;
+    struct timespec cur_time = prev_frame->timestamp;
     unsigned char bigbuffer[(1280*960)];
 
     // Assignment log
