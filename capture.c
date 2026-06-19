@@ -73,6 +73,12 @@
 #define VRES 480
 #define HRES_STR "640"
 #define VRES_STR "480"
+#define FRAME_HEIGHT VRES
+#define FRAME_WIDTH (HRES * 2)
+#define SIZE (FRAME_HEIGHT * FRAME_WIDTH)
+
+#define KERNEL_HEIGHT 3
+#define KERNEL_WIDTH 3
 
 #define NUM_REQ_BUFS 6
 //#define NUM_BIT_BUCKETS 10
@@ -1416,19 +1422,55 @@ static void modify_frame(struct ring_buf *selected_frame_bufs, struct ring_buf *
         int *modify_count)
 {
     int frame_count, selected_frame_idx, modified_frame_idx;
-    int val_idx, val;
+    int val_idx, val, h_val, v_val;
+    int pixel_pos[KERNEL_HEIGHT][KERNEL_WIDTH] = { {-FRAME_WIDTH-2, -FRAME_WIDTH, -FRAME_WIDTH+2},
+                                                   {            -2,            0,              2},
+                                                   { FRAME_WIDTH-2,  FRAME_WIDTH,  FRAME_WIDTH+2} };
+    int g_x[KERNEL_HEIGHT][KERNEL_WIDTH] = { {-1, 0, 1},
+                                             {-2, 0, 2},
+                                             {-1, 0, 1} };
+    int g_y[KERNEL_HEIGHT][KERNEL_WIDTH] = { {-1, -2, -1},
+                                             { 0,  0,  0},
+                                             { 1,  2,  1} };
 
     // Modify and copy each frame in window
     for (frame_count = 0; frame_count < (int)ceil((double)rate/MODIFY_FREQ); frame_count++) {
         selected_frame_idx = (selected_frame_bufs->tail + frame_count) % selected_frame_bufs->size;
         modified_frame_idx = (modified_frame_bufs->head + frame_count) % modified_frame_bufs->size;
-        // Copy every frame value
+
+        // Apply Sobel filter
         for (val_idx = 0; val_idx < selected_frame_bufs->start[selected_frame_idx].bytesused; val_idx++) {
             val = selected_frame_bufs->start[selected_frame_idx].start[val_idx];
-            // Invert luma (Y value)
-            if (val_idx % 2 == 0) {
-                val = 255 - val;
+
+            if ((val_idx % 2 == 1) ||                                              // Odd idx = UV channels
+                (val_idx < FRAME_WIDTH) || (val_idx >= (SIZE - FRAME_WIDTH)) ||     // First and last row
+                (val_idx % FRAME_WIDTH == 0) || ((val_idx+2) % FRAME_WIDTH == 0)) {  // First and last Y columns
+                val = selected_frame_bufs->start[selected_frame_idx].start[val_idx];
             }
+            else {
+                // Horizontal
+                h_val = 0;
+                for (int i = 0; i < KERNEL_HEIGHT; i++) {
+                    for (int j = 0; j < KERNEL_WIDTH; j++) {
+                        h_val += g_x[i][j] * selected_frame_bufs->start[selected_frame_idx].start[val_idx + pixel_pos[i][j]];
+                    }
+                }
+
+                // Vertical
+                v_val = 0;
+                for (int i = 0; i < KERNEL_HEIGHT; i++) {
+                    for (int j = 0; j < KERNEL_WIDTH; j++) {
+                        v_val += g_y[i][j] * selected_frame_bufs->start[selected_frame_idx].start[val_idx + pixel_pos[i][j]];
+                    }
+                }
+
+                val = abs(h_val) + abs(v_val);
+                if (val < 0)
+                    val = 0;
+                else if (val > 255)
+                    val = 255;
+            }
+
             modified_frame_bufs->start[modified_frame_idx].start[val_idx] = val;
         }
 
