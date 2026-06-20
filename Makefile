@@ -13,6 +13,9 @@ endif
 ifeq ($(INFO), 1)
 	CFLAGS += -DINFO
 endif
+ifeq ($(ASSIGNMENT), 1)
+	CFLAGS += -DASSIGNMENT
+endif
 LDFLAGS = -lrt -lpthread -lm
 
 HFILES = 
@@ -35,6 +38,10 @@ depend:
 
 video:
 	ffmpeg -framerate 4 -pattern_type glob -i "frames/*.ppm" -c:v libx264 -pix_fmt yuv420p frames.mp4
+
+clear-journal:
+	sudo journalctl --rotate
+	sudo journalctl --vacuum-time=1s
 
 .c.o:
 	$(CC) $(CFLAGS) -c $<

@@ -241,7 +241,7 @@ static void free_ring_buffers(struct ring_buf *input_ring_buf, struct ring_buf *
 static void timer_handler(union sigval arg);
 static void *sequencer(void *arg);
 void *read_frame_thread(void *arg);
-static int read_frame(struct ring_buf *input_frame_bufs, struct timespec capture_time);
+static int read_frame(struct ring_buf *input_frame_bufs);
 void *select_frame_thread(void *arg);
 static void select_frame(struct ring_buf *input_frame_bufs, struct ring_buf *selected_frame_bufs, int *select_count);
 void *modify_frame_thread(void *arg);
@@ -1067,7 +1067,7 @@ void *read_frame_thread(void *arg)
                 exit(EXIT_FAILURE);
             }
 
-            if (read_frame(input_frame_bufs, service_release_time))
+            if (read_frame(input_frame_bufs))
             {
                 if(nanosleep(&read_delay, &time_error) != 0)
                     perror("nanosleep");
@@ -1094,15 +1094,23 @@ void *read_frame_thread(void *arg)
     *read_finished = 1;
 }
 
-static int read_frame(struct ring_buf *input_frame_bufs, struct timespec capture_time)
+static int read_frame(struct ring_buf *input_frame_bufs)
 {
     int r;
     struct v4l2_buffer buf;
+    struct timespec capture_time;
     unsigned int i;
 
     CLEAR(buf);
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
+
+    // Get frame capture time
+    if (clock_gettime(CLOCKID, &capture_time) == -1) {
+        fprintf(stderr, "Error read_frame_thread: Failed to get thread start time: %d, %s\n",
+                errno, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
     // Dequeue frame buffer
     if (-1 == xioctl(fd, VIDIOC_DQBUF, &buf))
@@ -1603,9 +1611,13 @@ void write_frame(struct frame_buf *prev_frame, int32_t write_count)
 
     // Assignment log
     int sec = cur_time.tv_sec - start_time.tv_sec;
-    int dsec = (cur_time.tv_nsec - start_time.tv_nsec) / 100000000;
+    long long nsec = cur_time.tv_nsec - start_time.tv_nsec;
+    if (nsec < 0) {
+        sec--;
+        nsec += NSEC_PER_SEC;
+    }
     SYSLOG_CRIT("[Course #:4] [Final Project] [Frame Count: %d] "
-            "[Image Capture Start Time: %d.%d seconds]\n", write_count, sec, dsec);
+            "[Image Capture Start Time: %d.%09llu seconds]\n", write_count, sec, nsec);
 
     /* Dump frame */
     if (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV) {
