@@ -218,6 +218,8 @@ static int modify = 0;
 struct timespec start_time;
 uint32_t frame_buf_length;
 
+char *platform_info = NULL;
+size_t len_platform_info = 0;
 char pgm_header[]="P5\n#9999999999 sec 9999999999 msec \n"HRES_STR" "VRES_STR"\n255\n";
 char pgm_dumpname[]="frames/test00000000.pgm";
 
@@ -268,23 +270,20 @@ double get_delta_time_real(struct timespec cur_time, struct timespec prev_time);
 int main(int argc, char **argv)
 {
     FILE *pp;
-    char *cpu_info = NULL;
-    size_t len = 0;
 
     // Log processor info
     if ((pp = popen("uname -a", "r")) == NULL) {
        perror("Error opening pipe");
        exit(1);
     }   
-    if (getline(&cpu_info, &len, pp) == -1) {
+    if (getline(&platform_info, &len_platform_info, pp) == -1) {
        perror("Error getting cpu info");
        exit(1);
     }   
 
     SYSLOG_INFO("====================STARTING CAPTURE.C====================\n");
 
-    SYSLOG_CRIT("[Course#:4][Final Project]: %s", cpu_info);
-    free(cpu_info);
+    SYSLOG_CRIT("[Course#:4][Final Project]: %s", platform_info);
 
     // Get command-line options
     for (;;)
@@ -365,6 +364,9 @@ int main(int argc, char **argv)
     stop_capturing();
     uninit_device();
     close_device();
+
+    free(platform_info);
+
     fprintf(stderr, "\n");
     return 0;
 }
@@ -1726,6 +1728,8 @@ static void dump_pgm(const void *p, int size, unsigned int tag, struct timespec 
 
     // subtract 1 because sizeof for string includes null terminator
     written=write(dumpfd, pgm_header, sizeof(pgm_header)-1);
+    write(dumpfd, "#", 1);
+    write(dumpfd, platform_info, len_platform_info-1);
 
     total=0;
 
@@ -1756,6 +1760,8 @@ static void dump_ppm(const void *p, int size, unsigned int tag, struct timespec 
 
     // subtract 1 because sizeof for string includes null terminator
     written=write(dumpfd, ppm_header, sizeof(ppm_header)-1);
+    write(dumpfd, "#", 1);
+    write(dumpfd, platform_info, len_platform_info-1);
 
     total=0;
 
