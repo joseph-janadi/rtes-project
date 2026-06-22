@@ -1036,7 +1036,7 @@ void *read_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
-        SYSLOG_INFO("S1 %d @ %lf", read_count, delta_time_real);
+        SYSLOG_INFO("S1 release %d @ %lf", read_count, delta_time_real);
 
         // Repeatedly call read() until succeeds
         for (;;) {
@@ -1079,14 +1079,14 @@ void *read_frame_thread(void *arg)
             // Read failed; try again
         }
 
-        // Log read service execution time
+        // Log read service response time
         if (clock_gettime(CLOCKID, &service_response_time) == -1) {
             fprintf(stderr, "Error read_frame_thread: Failed to get thread end time: %d, %s\n",
                     errno, strerror(errno));
             exit(EXIT_FAILURE);
         }
-        delta_time_real = get_delta_time_real(service_response_time, service_release_time);
-        SYSLOG_DEBUG("Read thread execution time %d = %lf", read_count, delta_time_real);
+        delta_time_real = get_delta_time_real(service_response_time, start_time);
+        SYSLOG_INFO("S1 response %d @ %lf", read_count, delta_time_real);
 
         read_count++;
     }
@@ -1143,7 +1143,7 @@ static int read_frame(struct ring_buf *input_frame_bufs)
     }
 
     // Copy frame from video buffer to input_frame_bufs
-    SYSLOG_DEBUG("Read from camera index %d to input index %d\n",
+    SYSLOG_DEBUG("Read from camera index %d to input index %d",
             buf.index, input_frame_bufs->head);
     memcpy(input_frame_bufs->start[input_frame_bufs->head].start,
             buffers[buf.index].start, buf.bytesused);
@@ -1201,7 +1201,7 @@ void *select_frame_thread(void *arg)
                 input_frame_bufs->size;
             if ((window_head <= input_frame_bufs->head)
                     && (window_tail >= input_frame_bufs->head)) {
-                SYSLOG_DEBUG("Select window overtook read: ph = %d, pt = %d, r = %d\n",
+                SYSLOG_DEBUG("Select window overtook read: ph = %d, pt = %d, r = %d",
                         window_head, window_tail, input_frame_bufs->head);
                 continue;
             }
@@ -1209,7 +1209,7 @@ void *select_frame_thread(void *arg)
             if (window_tail < window_head) {
                 if ((window_head <= input_frame_bufs->head)
                         || (window_tail >= input_frame_bufs->head)) {
-                    SYSLOG_DEBUG("Select window overtook read: ph = %d, pt = %d, r = %d\n",
+                    SYSLOG_DEBUG("Select window overtook read: ph = %d, pt = %d, r = %d",
                             window_head, window_tail, input_frame_bufs->head);
                     continue;
                 }
@@ -1223,25 +1223,25 @@ void *select_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
-        SYSLOG_INFO("S2 %d @ %lf", select_release, delta_time_real);
-        select_release++;
+        SYSLOG_INFO("S2 release %d @ %lf", select_release, delta_time_real);
 
         // Find best frame in input_frame_bufs window and copy to
         // selected_frame_bufs
         select_frame(input_frame_bufs, selected_frame_bufs, &select_count);
 
-        // Increment select count
+        // Check if select finished
         if (select_count >= select_frames)
             break;
 
-        // Log select service execution time
+        // Log select service response time
         if (clock_gettime(CLOCKID, &service_response_time) == -1) {
             fprintf(stderr, "Error select_frame_thread: Failed to get thread end time: %d, %s\n",
                     errno, strerror(errno));
             exit(EXIT_FAILURE);
         }
-        delta_time_real = get_delta_time_real(service_response_time, service_release_time);
-        SYSLOG_DEBUG("Select thread execution time %d = %lf", select_release-1, delta_time_real);
+        delta_time_real = get_delta_time_real(service_response_time, start_time);
+        SYSLOG_INFO("S2 response %d @ %lf", select_release, delta_time_real);
+        select_release++;
     }
 
     *select_finished = 1;
@@ -1285,7 +1285,7 @@ static void select_frame(struct ring_buf *input_frame_bufs, struct ring_buf *sel
             }
 
             // Copy frame
-            SYSLOG_DEBUG("Selecting from input index %d to selected index %d\n",
+            SYSLOG_DEBUG("Selecting from input index %d to selected index %d",
                     next_frame_idx, selected_frame_bufs->head);
             memcpy(&selected_frame_bufs->start[selected_frame_bufs->head],
                     &input_frame_bufs->start[next_frame_idx], sizeof(struct frame_buf));
@@ -1317,13 +1317,13 @@ static void select_frame(struct ring_buf *input_frame_bufs, struct ring_buf *sel
         }
         average_diff = (double)sum / num_bytes;
         percent_diff = (average_diff / max_val) * 100;
-        SYSLOG_DEBUG("frame1 = %d, frame2 = %d, percent_diff = %lf\n",
+        SYSLOG_DEBUG("frame1 = %d, frame2 = %d, percent_diff = %lf",
                 frame1_idx, frame2_idx, percent_diff);
 
         // If tick detected, set next best frame
         if (percent_diff >= percent_diff_threshold) {
             next_frame_idx = (frame1_idx + ((READ_FREQ / rate + 1) / 2)) % input_frame_bufs->size;
-            SYSLOG_DEBUG("Window = %d..%d; Tick Index = %d; Selected Index = %d\n",
+            SYSLOG_DEBUG("Window = %d..%d; Tick Index = %d; Selected Index = %d",
                     input_frame_bufs->tail, (input_frame_bufs->tail + READ_FREQ/SELECT_FREQ - 1) % input_frame_bufs->size,
                     frame1_idx, next_frame_idx);
         }
@@ -1333,7 +1333,7 @@ static void select_frame(struct ring_buf *input_frame_bufs, struct ring_buf *sel
             // If too many frames skipped, set next_frame_idx based on last_frame_idx
             if (num_frames_skipped == (READ_FREQ / rate)) {
                 next_frame_idx = (last_frame_idx + (READ_FREQ / rate)) % input_frame_bufs->size;
-                SYSLOG_DEBUG("No Tick Detected; Selected Index = %d\n", next_frame_idx);
+                SYSLOG_DEBUG("No Tick Detected; Selected Index = %d", next_frame_idx);
             }
         }
     }
@@ -1383,7 +1383,7 @@ void *modify_frame_thread(void *arg)
             window_tail = (window_head + (int)ceil((double)rate/MODIFY_FREQ) - 1) % selected_frame_bufs->size;
             if ((window_head <= selected_frame_bufs->head)
                     && (window_tail >= selected_frame_bufs->head)) {
-                SYSLOG_DEBUG("Modify window overtook select: ph = %d, pt = %d, r = %d\n",
+                SYSLOG_DEBUG("Modify window overtook select: ph = %d, pt = %d, r = %d",
                         window_head, window_tail, selected_frame_bufs->head);
                 continue;
             }
@@ -1391,7 +1391,7 @@ void *modify_frame_thread(void *arg)
             if (window_tail < window_head) {
                 if ((window_head <= selected_frame_bufs->head)
                         || (window_tail >= selected_frame_bufs->head)) {
-                    SYSLOG_DEBUG("Modify window overtook select: ph = %d, pt = %d, r = %d\n",
+                    SYSLOG_DEBUG("Modify window overtook select: ph = %d, pt = %d, r = %d",
                             window_head, window_tail, selected_frame_bufs->head);
                     continue;
                 }
@@ -1405,13 +1405,12 @@ void *modify_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
-        SYSLOG_INFO("S3 %d @ %lf", modify_release, delta_time_real);
-        modify_release++;
+        SYSLOG_INFO("S3 release %d @ %lf", modify_release, delta_time_real);
 
         // Modify next selected frame and copy to modified_frame_bufs
         modify_frame(selected_frame_bufs, modified_frame_bufs, &modify_count);
 
-        // Increment modify count
+        // Check if modify finished
         if (modify_count >= modify_frames)
             break;
 
@@ -1421,8 +1420,9 @@ void *modify_frame_thread(void *arg)
                     errno, strerror(errno));
             exit(EXIT_FAILURE);
         }
-        delta_time_real = get_delta_time_real(service_response_time, service_release_time);
-        SYSLOG_DEBUG("Modify thread execution time %d = %lf", modify_release-1, delta_time_real);
+        delta_time_real = get_delta_time_real(service_response_time, start_time);
+        SYSLOG_INFO("S3 response %d @ %lf", modify_release, delta_time_real);
+        modify_release++;
     }
 
     *modify_finished = 1;
@@ -1533,7 +1533,7 @@ void *write_frame_thread(void *arg)
             window_tail = (window_head + (int)ceil((double)rate/WRITE_FREQ) - 1) % prev_frame_bufs->size;
             if ((window_head <= prev_frame_bufs->head)
                     && (window_tail >= prev_frame_bufs->head)) {
-                SYSLOG_DEBUG("Write window overtook prev: ph = %d, pt = %d, r = %d\n",
+                SYSLOG_DEBUG("Write window overtook prev: ph = %d, pt = %d, r = %d",
                         window_head, window_tail, prev_frame_bufs->head);
                 continue;
             }
@@ -1541,7 +1541,7 @@ void *write_frame_thread(void *arg)
             if (window_tail < window_head) {
                 if ((window_head <= prev_frame_bufs->head)
                         || (window_tail >= prev_frame_bufs->head)) {
-                    SYSLOG_DEBUG("Write window wrapped and overtook prev\n");
+                    SYSLOG_DEBUG("Write window wrapped and overtook prev");
                     continue;
                 }
             }
@@ -1554,12 +1554,11 @@ void *write_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
-        SYSLOG_INFO("S4 %d @ %lf", write_release, delta_time_real);
-        write_release++;
+        SYSLOG_INFO("S4 release %d @ %lf", write_release, delta_time_real);
 
         // Bit-bucket first frames
         if (write_count < 0) {
-            SYSLOG_DEBUG("Bit-bucket frame %d\n", write_count);
+            SYSLOG_DEBUG("Bit-bucket frame %d", write_count);
 
             prev_frame_bufs->tail += (int)ceil((double)rate/WRITE_FREQ);
             write_count += (int)ceil((double)rate/WRITE_FREQ);
@@ -1569,7 +1568,7 @@ void *write_frame_thread(void *arg)
 
         // Write rate number of images to memory
         for (int i = 0; i < (int)ceil((double)rate/WRITE_FREQ); i++) {
-            SYSLOG_DEBUG("Writing from prev index %d\n", prev_frame_bufs->tail);
+            SYSLOG_DEBUG("Writing from prev index %d", prev_frame_bufs->tail);
             write_frame(&prev_frame_bufs->start[prev_frame_bufs->tail], write_count);
 
             prev_frame_bufs->tail++;
@@ -1583,6 +1582,7 @@ void *write_frame_thread(void *arg)
                 break;
         }
 
+        // Check if write finished
         if (write_count >= write_frames)
             break;
 
@@ -1592,8 +1592,9 @@ void *write_frame_thread(void *arg)
                     errno, strerror(errno));
             exit(EXIT_FAILURE);
         }
-        delta_time_real = get_delta_time_real(service_response_time, service_release_time);
-        SYSLOG_DEBUG("Write thread execution time %d = %lf", write_count, delta_time_real);
+        delta_time_real = get_delta_time_real(service_response_time, start_time);
+        SYSLOG_INFO("S4 response %d @ %lf", write_release, delta_time_real);
+        write_release++;
     }
 
     *write_finished = 1;
