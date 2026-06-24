@@ -897,6 +897,9 @@ static void *sequencer(void *arg)
           SELECT_RELEASE_FREQ = SEQ_FREQ/SELECT_FREQ,
           MODIFY_RELEASE_FREQ = SEQ_FREQ/MODIFY_FREQ,
           WRITE_RELEASE_FREQ = SEQ_FREQ/WRITE_FREQ;
+    uint32_t read_release = 0, select_release = 0, modify_release = 0, write_release = 0;
+    struct timespec read_release_time, select_release_time, modify_release_time, write_release_time;
+    double delta_time_real;
 
     // Initialize timer handler pthread attributes
     CPU_ZERO(&cpu_set);
@@ -955,6 +958,16 @@ static void *sequencer(void *arg)
 
         // Release read semaphore
         if ((!*read_finished) && (seq_count % READ_RELEASE_FREQ == 0)) {
+            // Log read service release time
+            if (clock_gettime(CLOCKID, &read_release_time) == -1) {
+                fprintf(stderr, "Error read_frame_thread: Failed to get thread start time: %d, %s\n",
+                        errno, strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            delta_time_real = get_delta_time_real(read_release_time, start_time);
+            SYSLOG_INFO("S1 release %d @ %lf", read_release, delta_time_real);
+            read_release++;
+
             r = sem_post(read_sem);
             if (r) {
                 fprintf(stderr, "Error sequencer: Failed to post read semaphore: %d, %s\n",
@@ -965,6 +978,16 @@ static void *sequencer(void *arg)
 
         // Release select semaphore
         if ((!*select_finished) && (seq_count % SELECT_RELEASE_FREQ == 0)) {
+            // Log select service release time
+            if (clock_gettime(CLOCKID, &select_release_time) == -1) {
+                fprintf(stderr, "Error select_frame_thread: Failed to get thread start time: %d, %s\n",
+                        errno, strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            delta_time_real = get_delta_time_real(select_release_time, start_time);
+            SYSLOG_INFO("S2 release %d @ %lf", select_release, delta_time_real);
+            select_release++;
+
             r = sem_post(select_sem);
             if (r) {
                 fprintf(stderr, "Error sequencer: Failed to post select semaphore: %d, %s\n",
@@ -975,6 +998,16 @@ static void *sequencer(void *arg)
 
         // Release modify semaphore
         if ((!*modify_finished) && (seq_count % MODIFY_RELEASE_FREQ == 0)) {
+            // Log modify service release time
+            if (clock_gettime(CLOCKID, &modify_release_time) == -1) {
+                fprintf(stderr, "Error modify_frame_thread: Failed to get thread start time: %d, %s\n",
+                        errno, strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            delta_time_real = get_delta_time_real(modify_release_time, start_time);
+            SYSLOG_INFO("S3 release %d @ %lf", modify_release, delta_time_real);
+            modify_release++;
+
             r = sem_post(modify_sem);
             if (r) {
                 fprintf(stderr, "Error sequencer: Failed to post modify semaphore: %d, %s\n",
@@ -985,6 +1018,16 @@ static void *sequencer(void *arg)
 
         // Release write semaphore
         if ((!*write_finished) && (seq_count % WRITE_RELEASE_FREQ == 0)) {
+            // Log write service release time
+            if (clock_gettime(CLOCKID, &write_release_time) == -1) {
+                fprintf(stderr, "Error write_frame_thread: Failed to get thread start time: %d, %s\n",
+                        errno, strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            delta_time_real = get_delta_time_real(write_release_time, start_time);
+            SYSLOG_INFO("S4 release %d @ %lf", write_release, delta_time_real);
+            write_release++;
+
             r = sem_post(write_sem);
             if (r) {
                 fprintf(stderr, "Error sequencer: Failed to post write semaphore: %d, %s\n",
@@ -1029,6 +1072,7 @@ void *read_frame_thread(void *arg)
             exit(EXIT_FAILURE);
         }
 
+        /*
         // Log read service release time
         if (clock_gettime(CLOCKID, &service_release_time) == -1) {
             fprintf(stderr, "Error read_frame_thread: Failed to get thread start time: %d, %s\n",
@@ -1037,6 +1081,7 @@ void *read_frame_thread(void *arg)
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
         SYSLOG_INFO("S1 release %d @ %lf", read_count, delta_time_real);
+        */
 
         // Repeatedly call read() until succeeds
         for (;;) {
@@ -1216,6 +1261,7 @@ void *select_frame_thread(void *arg)
             }
         }
         
+        /*
         // Log select service release time
         if (clock_gettime(CLOCKID, &service_release_time) == -1) {
             fprintf(stderr, "Error select_frame_thread: Failed to get thread start time: %d, %s\n",
@@ -1224,6 +1270,7 @@ void *select_frame_thread(void *arg)
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
         SYSLOG_INFO("S2 release %d @ %lf", select_release, delta_time_real);
+        */
 
         // Find best frame in input_frame_bufs window and copy to
         // selected_frame_bufs
@@ -1385,6 +1432,7 @@ void *modify_frame_thread(void *arg)
                     && (window_tail >= selected_frame_bufs->head)) {
                 SYSLOG_DEBUG("Modify window overtook select: ph = %d, pt = %d, r = %d",
                         window_head, window_tail, selected_frame_bufs->head);
+                modify_release++;
                 continue;
             }
             // Modify window wrapped around ring buffer
@@ -1393,11 +1441,13 @@ void *modify_frame_thread(void *arg)
                         || (window_tail >= selected_frame_bufs->head)) {
                     SYSLOG_DEBUG("Modify window overtook select: ph = %d, pt = %d, r = %d",
                             window_head, window_tail, selected_frame_bufs->head);
+                    modify_release++;
                     continue;
                 }
             }
         }
         
+        /*
         // Log modify service release time
         if (clock_gettime(CLOCKID, &service_release_time) == -1) {
             fprintf(stderr, "Error modify_frame_thread: Failed to get thread start time: %d, %s\n",
@@ -1406,6 +1456,7 @@ void *modify_frame_thread(void *arg)
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
         SYSLOG_INFO("S3 release %d @ %lf", modify_release, delta_time_real);
+        */
 
         // Modify next selected frame and copy to modified_frame_bufs
         modify_frame(selected_frame_bufs, modified_frame_bufs, &modify_count);
@@ -1547,6 +1598,7 @@ void *write_frame_thread(void *arg)
             }
         }
 
+        /*
         // Log write service release time
         if (clock_gettime(CLOCKID, &service_release_time) == -1) {
             fprintf(stderr, "Error write_frame_thread: Failed to get thread start time: %d, %s\n",
@@ -1555,6 +1607,7 @@ void *write_frame_thread(void *arg)
         }
         delta_time_real = get_delta_time_real(service_release_time, start_time);
         SYSLOG_INFO("S4 release %d @ %lf", write_release, delta_time_real);
+        */
 
         // Bit-bucket first frames
         if (write_count < 0) {
