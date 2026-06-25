@@ -4,7 +4,7 @@ CC = gcc
 
 CDEFS =
 CFLAGS = $(INCLUDE_DIRS) $(CDEFS)
-INFO = 1
+INFO = 0
 ASSIGNMENT = 1
 ifeq ($(DEBUG), 1)
     CFLAGS += -O0 -g -DDEBUG
