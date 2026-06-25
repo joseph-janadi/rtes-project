@@ -14,15 +14,15 @@ This project:
 
 ## Requirements
 
-- Use a web camera to capture and save frames of an analog clock at a rate of 1
-  Hz and a digital clock at a rate of 10 Hz.
+- Use a web camera to capture frames of a clock at a rate of at least 20 Hz.
+- The project must be able save frames captured at a rate of 1 Hz from an analog
+  clock and 10 Hz from a digital clock.
 - The captured frames must have a frame size of at least 320x240 pixels.
-- There must be 1800+1 captured and saved frames with no repeats, skips, or
-  blurs.
+- The project must capture 1800+1 frames with no repeats, skips, or tick
+  transitions.
 - There must be an option to implement an image processing algorithm on the
   captured and saved frames.
-- The project must have at least two real-time services running on a single
-  core.
+- The project must run at least two real-time services on a single core.
 
 ## Data Flow Diagram
 
@@ -36,14 +36,18 @@ This project:
 
 | Service   | WCET (ms) | T (ms)    | D (ms)    | Core  |
 | ---       | ---       | ---       | ---       | ---   |
-| Read      | 0.25      | 33        | 33        | 2     | 
-| Select    | 25        | 200       | 200       | 2     |
-| Modify    | ??        | 500       | 500       | 2     |
-| Write     | 65        | 1000      | 1000      | 2     |
+| Read      |   3       |   33      |   33      | 2     | 
+| Select    |  25       |  200      |  200      | 2     |
+| Modify    |  30       |  500      |  500      | 2     |
+| Write     | 500       | 1000      | 1000      | 2     |
 
-$U = \frac{0.25}{33} + \frac{25}{200} + \frac{65}{1000} = 0.1976 = 19.76\%$
+$U = \frac{3}{33} + \frac{25}{200} + \frac{30}{500} + \frac{500}{1000} = 0.7759 = 77.59\%$
+
+$LUB = m(2^{1/m} - 1) = 4(2^{1/4} - 1) = 0.7568 = 75.68\%$
 
 ### Timing Diagram
+
+<img src="images/timing-diagram.png">
 
 ## Real-Time Analysis of Results
 
