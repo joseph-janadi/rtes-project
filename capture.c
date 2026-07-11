@@ -237,7 +237,8 @@ static void start_capturing(void);
 static void run_threads(void);
 static void init_ring_buffer(struct ring_buf *input_frame_bufs, struct ring_buf *selected_frame_bufs,
         struct ring_buf *modified_frame_bufs);
-static void free_ring_buffers(struct ring_buf *input_ring_buf, struct ring_buf *selected_frame_bufs);
+static void free_ring_buffers(struct ring_buf *input_frame_bufs, struct ring_buf *selected_frame_bufs,
+        struct ring_buf *modified_frame_bufs);
 static void timer_handler(union sigval arg);
 static void *sequencer(void *arg);
 void *read_frame_thread(void *arg);
@@ -761,8 +762,8 @@ static void run_threads(void)
         exit(EXIT_FAILURE);
     }
 
-    // TODO: Free ring buffers memory
-    //free_ring_buffers(&input_ring_buf, &selected_frame_bufs);
+    // Free ring buffers memory
+    free_ring_buffers(&input_frame_bufs, &selected_frame_bufs, &modified_frame_bufs);
 }
 
 /* Allocates memory for the ring buffer */
@@ -855,9 +856,24 @@ static void init_ring_buffer(struct ring_buf *input_frame_bufs, struct ring_buf 
     modified_frame_bufs->tail_wraps = 0;
 }
 
-/* TODO: Frees ring buffer memory */
-static void free_ring_buffers(struct ring_buf *input_ring_buf, struct ring_buf *selected_frame_bufs)
+/* Frees ring buffer memory */
+static void free_ring_buffers(struct ring_buf *input_frame_bufs, struct ring_buf *selected_frame_bufs,
+        struct ring_buf *modified_frame_bufs)
 {
+    for (int i = 0; i < input_frame_bufs->size; i++) {
+        free(input_frame_bufs->start[i].start);
+    }
+    free(input_frame_bufs->start);
+
+    for (int i = 0; i < selected_frame_bufs->size; i++) {
+        free(selected_frame_bufs->start[i].start);
+    }
+    free(selected_frame_bufs->start);
+
+    for (int i = 0; i < modified_frame_bufs->size; i++) {
+        free(modified_frame_bufs->start[i].start);
+    }
+    free(modified_frame_bufs->start);
 }
 
 /* Releases sequencer thread when timer expires */
@@ -1190,10 +1206,9 @@ static int read_frame(struct ring_buf *input_frame_bufs)
     // Copy frame from video buffer to input_frame_bufs
     SYSLOG_DEBUG("Read from camera index %d to input index %d",
             buf.index, input_frame_bufs->head);
+
     memcpy(input_frame_bufs->start[input_frame_bufs->head].start,
             buffers[buf.index].start, buf.bytesused);
-
-    // Update frame buffer parameters
     input_frame_bufs->start[input_frame_bufs->head].bytesused = buf.bytesused;
     input_frame_bufs->start[input_frame_bufs->head].timestamp = capture_time;
 
@@ -1260,17 +1275,6 @@ void *select_frame_thread(void *arg)
                 }
             }
         }
-        
-        /*
-        // Log select service release time
-        if (clock_gettime(CLOCKID, &service_release_time) == -1) {
-            fprintf(stderr, "Error select_frame_thread: Failed to get thread start time: %d, %s\n",
-                    errno, strerror(errno));
-            exit(EXIT_FAILURE);
-        }
-        delta_time_real = get_delta_time_real(service_release_time, start_time);
-        SYSLOG_INFO("S2 release %d @ %lf", select_release, delta_time_real);
-        */
 
         // Find best frame in input_frame_bufs window and copy to
         // selected_frame_bufs
@@ -1334,8 +1338,14 @@ static void select_frame(struct ring_buf *input_frame_bufs, struct ring_buf *sel
             // Copy frame
             SYSLOG_DEBUG("Selecting from input index %d to selected index %d",
                     next_frame_idx, selected_frame_bufs->head);
-            memcpy(&selected_frame_bufs->start[selected_frame_bufs->head],
-                    &input_frame_bufs->start[next_frame_idx], sizeof(struct frame_buf));
+
+            memcpy(selected_frame_bufs->start[selected_frame_bufs->head].start,
+                    input_frame_bufs->start[next_frame_idx].start, input_frame_bufs->start[next_frame_idx].bytesused);
+            selected_frame_bufs->start[selected_frame_bufs->head].bytesused =
+                input_frame_bufs->start[next_frame_idx].bytesused;
+            selected_frame_bufs->start[selected_frame_bufs->head].timestamp =
+                input_frame_bufs->start[next_frame_idx].timestamp;
+
             selected_frame_bufs->head++;
             if (selected_frame_bufs->head >= selected_frame_bufs->size) {
                 selected_frame_bufs->head %= selected_frame_bufs->size;
@@ -1446,17 +1456,6 @@ void *modify_frame_thread(void *arg)
                 }
             }
         }
-        
-        /*
-        // Log modify service release time
-        if (clock_gettime(CLOCKID, &service_release_time) == -1) {
-            fprintf(stderr, "Error modify_frame_thread: Failed to get thread start time: %d, %s\n",
-                    errno, strerror(errno));
-            exit(EXIT_FAILURE);
-        }
-        delta_time_real = get_delta_time_real(service_release_time, start_time);
-        SYSLOG_INFO("S3 release %d @ %lf", modify_release, delta_time_real);
-        */
 
         // Modify next selected frame and copy to modified_frame_bufs
         modify_frame(selected_frame_bufs, modified_frame_bufs, &modify_count);
